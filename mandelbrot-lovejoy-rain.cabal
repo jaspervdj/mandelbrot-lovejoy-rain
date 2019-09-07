@@ -1,0 +1,32 @@
+Cabal-version:  1.12
+Name:           mandelbrot-lovejoy-rain
+Version:        0.1.0.0
+Description:    Please see the README on GitHub at <https://github.com/jaspervdj/mandelbrot-lovejoy-rain#readme>
+Homepage:       https://github.com/jaspervdj/mandelbrot-lovejoy-rain#readme
+Bug-reports:    https://github.com/jaspervdj/mandelbrot-lovejoy-rain/issues
+Author:         Jasper Van der Jeugt <m@jaspervdj.be>
+Maintainer:     Jasper Van der Jeugt <m@jaspervdj.be>
+Copyright:      2019 Jasper Van der Jeugt
+License:        BSD3
+License-file:   LICENSE
+Build-type:     Simple
+
+Source-repository head
+  Type: git
+  Location: https://github.com/jaspervdj/mandelbrot-lovejoy-rain
+
+executable mandelbrot-lovejoy-rain
+  Main-is:         Main.hs
+  Hs-source-dirs:  src
+  Ghc-options:     -threaded -rtsopts
+                   -with-rtsopts=-N
+                   -with-rtsopts=-n2M
+                   -with-rtsopts=-A64M
+  Default-language: Haskell2010
+
+  Build-depends:
+    accelerate             >= 1.2 && < 1.3,
+    accelerate-io          >= 1.2 && < 1.3,
+    accelerate-llvm-native >= 1.2 && < 1.3,
+    base                   >= 4.7 && < 5,
+    colour-accelerate      >= 0.3 && < 0.4

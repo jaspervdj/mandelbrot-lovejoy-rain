@@ -1,0 +1,13 @@
+resolver: lts-13.0
+packages:
+- .
+extra-deps:
+- 'accelerate-1.2.0.1'
+- 'accelerate-io-1.2.0.0'
+- 'accelerate-llvm-1.2.0.1'
+- 'accelerate-llvm-native-1.2.0.1'
+- 'colour-accelerate-0.3.0.0'
+- 'hedgehog-1.0'
+- 'llvm-hs-8.0.0'
+- 'llvm-hs-pure-8.0.0'
+- 'tasty-hedgehog-1.0.0.1'
