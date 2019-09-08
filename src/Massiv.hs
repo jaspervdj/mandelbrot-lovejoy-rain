@@ -7,7 +7,9 @@ import qualified Codec.Picture.Gif                 as JP
 import qualified Codec.Picture.Png                 as JP
 import qualified Codec.Picture.Types               as JP
 import           Control.Monad                     (foldM, replicateM)
+import           Control.Monad.Primitive           (PrimMonad (..))
 import           Control.Monad.ST                  (runST)
+import           Data.Bool                         (bool)
 import           Data.List                         (foldl')
 import qualified Data.Massiv.Array                 as M
 import qualified Data.Massiv.Array.IO              as MIO
@@ -17,7 +19,7 @@ import           Data.Maybe                        (fromMaybe, listToMaybe)
 import           Data.Proxy                        (Proxy (..))
 import           Data.Word                         (Word8)
 import qualified Graphics.ColorSpace.RGB           as RGB
-import qualified Test.QuickCheck                   as QC
+import qualified System.Random.MWC                 as MWC
 
 newtype Radius   = Radius   {unRadius   :: Float}
 newtype Distance = Distance {unDistance :: Float}
@@ -63,27 +65,28 @@ bounds shape hp =
         end    = hpCenter hp .+. radIdx .+. unit in
     (start, end)
 
-instance M.MonadThrow QC.Gen where
-    throwM = fail . show
-
-arbitraryIndex :: forall ix. M.Index ix => ix -> QC.Gen ix
-arbitraryIndex choice =
+arbitraryIndex
+    :: forall m ix. (PrimMonad m, M.MonadThrow m, M.Index ix)
+    => MWC.Gen (PrimState m) -> ix -> m ix
+arbitraryIndex gen choice =
     foldM
-        (\gen dim -> do
+        (\acc dim -> do
             up <- M.getDimM choice (M.Dim dim)
-            x  <- QC.choose (0, up)
-            M.setDimM gen (M.Dim dim) x)
+            x  <- MWC.uniformR (0, up) gen
+            M.setDimM acc (M.Dim dim) x)
         choice
         [1 .. M.unDim (M.dimensions (Proxy :: Proxy ix))]
 
-arbitraryPulse :: M.Index ix => Float -> ix -> QC.Gen (HPulse ix)
-arbitraryPulse alpha area = do
-    center <- arbitraryIndex area
-    rhoInv <- QC.choose (0.0, 1.0)
+arbitraryPulse
+    :: forall m ix. (PrimMonad m, M.MonadThrow m, M.Index ix)
+    => MWC.Gen (PrimState m) -> Float -> ix -> m (HPulse ix)
+arbitraryPulse gen alpha area = do
+    center <- arbitraryIndex gen area
+    rhoInv <- MWC.uniformR (0.0, 1.0) gen
     let rho   =  if rhoInv == 0.0 then 1.0 else 1.0 / (1.0 - rhoInv)
         radius = rho / 2.0
         amp    = rho ** (1.0 / alpha)
-    ampSign <- QC.elements [-1.0, 1.0]
+    ampSign <- bool (-1.0) 1.0 <$> MWC.uniform gen
     return $ HPulse center (ampSign * amp) (Radius radius)
 
 data PulseShape
@@ -220,7 +223,9 @@ main = do
 
         curvy x = 1 - (1 -  x) * (1 - x) * (1 - x)
 
-    pulses <- QC.generate $ replicateM npulses $ arbitraryPulse alpha big
+    gen <- MWC.createSystemRandom
+
+    pulses <- replicateM npulses $ arbitraryPulse gen alpha big
     marr   <- MM.makeMArray (M.ParN 0) (M.Sz small) (\_ -> pure 0)
     mapM_ (drawPulse marr shape) $ map (offset off) $ filter relevant pulses
     arr <- MM.freeze (M.ParN 0) marr :: IO (M.Array M.P M.Ix3 Float)
