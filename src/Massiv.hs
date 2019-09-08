@@ -197,9 +197,9 @@ interpolateFrames num (x : y : ys) =
 
 main :: IO ()
 main = do
-    let numkeyframes =  60
-        nonkeyframes =   2
-        delay        =  10
+    let numkeyframes =   3
+        nonkeyframes =  24
+        delay        =   4
 
         height   = 100
         width    = 200
@@ -213,8 +213,10 @@ main = do
         npulses = M.totalElem (M.Sz big) * v
         alpha   = 5 / 3
         r0      = 0.7
+        rho_o   = fromIntegral (max height width) * 1.5
+        rho_i   = fromIntegral $ 3
 
-        relevant = (>= 3) . unRadius . hpRadius
+        relevant = (\r -> r >= rho_i && r <= rho_o) . unRadius . hpRadius
 
         curvy x = 1 - (1 -  x) * (1 - x) * (1 - x)
 
@@ -243,7 +245,7 @@ main = do
             | frame <- interpolateFrames nonkeyframes (map M.delay keyframes)
             ]
 
-    either fail id $ JP.writeComplexGifImage "massiv.gif" JP.GifEncode
+    either fail id $ JP.writeComplexGifImage "quick.gif" JP.GifEncode
         { JP.geWidth      = width
         , JP.geHeight     = height
         , JP.gePalette    = Just palette
@@ -261,4 +263,4 @@ main = do
                 , JP.gfPixels      = frame
                 }
         }
-    JP.writePng "palette.png" palette
+    -- JP.writePng "palette.png" palette
