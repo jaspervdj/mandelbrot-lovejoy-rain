@@ -3,7 +3,7 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 module Main where
 
-import           Control.Monad             (forM_, replicateM)
+import           Control.Monad             (replicateM)
 import           Control.Monad.ST          (runST)
 import           Data.List                 (foldl')
 import qualified Data.Massiv.Array         as M
@@ -11,7 +11,7 @@ import qualified Data.Massiv.Array.IO      as MIO
 import qualified Data.Massiv.Array.Mutable as MM
 import           Data.Maybe                (fromMaybe)
 import           Data.Proxy                (Proxy (..))
-import qualified Graphics.ColorSpace.Y     as Y
+import qualified Graphics.ColorSpace.RGB   as RGB
 import qualified Test.QuickCheck           as QC
 
 newtype Radius   = Radius   {unRadius   :: Float}
@@ -144,20 +144,38 @@ treshold relativeTreshold arr =
                         else go acc' (i + 1)  in
         go 0 0
 
+interpolate
+    :: RGB.Pixel RGB.RGB Float -> RGB.Pixel RGB.RGB Float
+    -> Float -> RGB.Pixel RGB.RGB Float
+interpolate (RGB.PixelRGB r0 g0 b0) (RGB.PixelRGB r1 g1 b1) t = RGB.PixelRGB
+    (r0 * (1.0 - t) + r1 * t)
+    (g0 * (1.0 - t) + g1 * t)
+    (b0 * (1.0 - t) + b1 * t)
+
 main :: IO ()
 main = do
     let fsize   = 3 * size :: Int
         size    = 400
         off     = 400
-        shape   = Smooth 4
+        shape   = Smooth 2
         v       = 10
         npulses = size * size * v
         alpha   = 5 / 3
         r0      = 0.7
 
+        blue  = RGB.PixelRGB 0.0 0.6 1.0
+        white = RGB.PixelRGB 1.0 1.0 1.0
+
+        relevant = (>= 3) . unRadius . hpRadius
+
+        curvy x = 1 - (1 -  x) * (1 - x) * (1 - x)
+
     pulses <- QC.generate $ replicateM npulses $ arbitraryPulse alpha fsize
     marr   <- MM.makeMArray (M.ParN 0) (M.Sz (M.pureIndex size)) (\_ -> pure 0)
-    forM_ (map (offset off) pulses) $ drawPulse marr shape
+    mapM_ (drawPulse marr shape) $ map (offset off) $ filter relevant pulses
     arr <- MM.freeze (M.ParN 0) marr :: IO (M.Array M.P M.Ix2 Float)
-    MIO.writeImageAuto "massiv.png" $ fmap Y.PixelY $ treshold r0 $ normalize $
+    MIO.writeImageAuto "massiv.png" $
+        fmap (interpolate blue white) $
+        fmap curvy $
+        treshold r0 $ normalize $
         M.delay arr
