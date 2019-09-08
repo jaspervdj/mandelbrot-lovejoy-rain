@@ -6,7 +6,7 @@ module Main where
 import qualified Codec.Picture.Gif                 as JP
 import qualified Codec.Picture.Png                 as JP
 import qualified Codec.Picture.Types               as JP
-import           Control.Monad                     (replicateM)
+import           Control.Monad                     (foldM, replicateM)
 import           Control.Monad.ST                  (runST)
 import           Data.List                         (foldl')
 import qualified Data.Massiv.Array                 as M
@@ -63,19 +63,22 @@ bounds shape hp =
         end    = hpCenter hp .+. radIdx .+. unit in
     (start, end)
 
-arbitraryIndex :: forall ix. M.Index ix => (Int, Int) -> QC.Gen ix
-arbitraryIndex choice = do
-    xyzs <- replicateM dim (QC.choose choice)
-    return $ foldl'
-        (\a (i, c) -> M.setDim' a (M.Dim i) c)
-        (M.pureIndex 0)
-        (zip [1 ..] xyzs)
-  where
-    dim = M.unDim $ M.dimensions (Proxy :: Proxy ix)
+instance M.MonadThrow QC.Gen where
+    throwM = fail . show
 
-arbitraryPulse :: M.Index ix => Float -> Int -> QC.Gen (HPulse ix)
-arbitraryPulse alpha l = do
-    center <- arbitraryIndex (0, l)
+arbitraryIndex :: forall ix. M.Index ix => ix -> QC.Gen ix
+arbitraryIndex choice =
+    foldM
+        (\gen dim -> do
+            up <- M.getDimM choice (M.Dim dim)
+            x  <- QC.choose (0, up)
+            M.setDimM gen (M.Dim dim) x)
+        choice
+        [1 .. M.unDim (M.dimensions (Proxy :: Proxy ix))]
+
+arbitraryPulse :: M.Index ix => Float -> ix -> QC.Gen (HPulse ix)
+arbitraryPulse alpha area = do
+    center <- arbitraryIndex area
     rhoInv <- QC.choose (0.0, 1.0)
     let rho   =  if rhoInv == 0.0 then 1.0 else 1.0 / (1.0 - rhoInv)
         radius = rho / 2.0
@@ -113,6 +116,7 @@ drawPulse marr shape pulse = M.iterM_ i0 end unit (<) $ \i -> MM.modifyM
     marrBounds  = (M.pureIndex 0, M.unSz (M.msize marr))
     (i0, end)   = intersection pulseBounds marrBounds
     -- bimap repair repair $ bounds pulse :: (ix, ix)
+{-# INLINE drawPulse #-}
 
 normalize
     :: (Functor (M.Array r ix), M.Source r ix Float)
@@ -152,20 +156,12 @@ treshold relativeTreshold arr =
                         else go acc' (i + 1)  in
         go 0 0
 
-interpolate
-    :: RGB.Pixel RGB.RGB Float -> RGB.Pixel RGB.RGB Float
-    -> Float -> RGB.Pixel RGB.RGB Float
-interpolate (RGB.PixelRGB r0 g0 b0) (RGB.PixelRGB r1 g1 b1) t = RGB.PixelRGB
-    (r0 * (1.0 - t) + r1 * t)
-    (g0 * (1.0 - t) + g1 * t)
-    (b0 * (1.0 - t) + b1 * t)
-
 floatToWord8 :: Float -> Word8
 floatToWord8 = round . (* 255)
 
 palette :: JP.Palette
 palette = JP.generateImage
-    (\x _ -> interpolate blue white $ fromIntegral x / 255.0)
+    (\x _ -> bluewhite blue white $ fromIntegral x / 255.0)
     256
     1
   where
@@ -173,42 +169,96 @@ palette = JP.generateImage
     blue  = JP.PixelRGBF 0.0 0.6 1.0
     white = JP.PixelRGBF 1.0 1.0 1.0
 
-    interpolate :: JP.PixelRGBF -> JP.PixelRGBF -> Float -> JP.PixelRGB8
-    interpolate (JP.PixelRGBF r0 g0 b0) (JP.PixelRGBF r1 g1 b1) t = JP.PixelRGB8
-        (floatToWord8 (r0 * (1.0 - t) + r1 * t))
-        (floatToWord8 (g0 * (1.0 - t) + g1 * t))
-        (floatToWord8 (b0 * (1.0 - t) + b1 * t))
+    bluewhite :: JP.PixelRGBF -> JP.PixelRGBF -> Float -> JP.PixelRGB8
+    bluewhite (JP.PixelRGBF r0 g0 b0) (JP.PixelRGBF r1 g1 b1) t = JP.PixelRGB8
+        (floatToWord8 $ interpolate t r0 r1)
+        (floatToWord8 $ interpolate t g0 g1)
+        (floatToWord8 $ interpolate t b0 b1)
+
+interpolate :: Float -> Float -> Float -> Float
+interpolate t x y = (1.0 - t) * x + t * y
+
+interpolateFrames
+    :: M.Index ix
+    => Int  -- Number of interpolation frames to insert
+    -> [M.Array M.D ix Float]
+    -> [M.Array M.D ix Float]
+interpolateFrames _   []           = []
+interpolateFrames _   [x]          = [x]
+interpolateFrames num (x : y : ys) =
+    [x] ++
+    [ M.zipWith (interpolate (fromIntegral n * spacing)) x y
+    | n <- [1 .. num]
+    ] ++
+    interpolateFrames num (y : ys)
+  where
+    spacing = 1.0 / fromIntegral (num + 1)
+
 
 main :: IO ()
 main = do
-    let fsize   = 3 * size :: Int
-        size    = 400
-        off     = 400
-        -- shape   = Annuli 1.1 2
-        shape   = Smooth 8
-        v       = 3 -- 10
-        npulses = size * size * v
-        alpha   = 5 / 3
-        r0      = 0.5
+    let numkeyframes =  60
+        nonkeyframes =   2
+        delay        =  10
 
-        blue  = RGB.PixelRGB 0.0 0.6 1.0
-        white = RGB.PixelRGB 1.0 1.0 1.0
+        height   = 100
+        width    = 200
+        small    = M.Ix3 numkeyframes height width
+        big      = small .+. small .+. small
+        off      = small
+
+        shape   = Annuli 1.1 2
+        -- shape   = Smooth 8
+        v       = 1
+        npulses = M.totalElem (M.Sz big) * v
+        alpha   = 5 / 3
+        r0      = 0.7
 
         relevant = (>= 3) . unRadius . hpRadius
 
         curvy x = 1 - (1 -  x) * (1 - x) * (1 - x)
 
-    pulses <- QC.generate $ replicateM npulses $ arbitraryPulse alpha fsize
-    marr   <- MM.makeMArray (M.ParN 0) (M.Sz (M.pureIndex size)) (\_ -> pure 0)
+    pulses <- QC.generate $ replicateM npulses $ arbitraryPulse alpha big
+    marr   <- MM.makeMArray (M.ParN 0) (M.Sz small) (\_ -> pure 0)
     mapM_ (drawPulse marr shape) $ map (offset off) $ filter relevant pulses
-    arr <- MM.freeze (M.ParN 0) marr :: IO (M.Array M.P M.Ix2 Float)
-    let img :: JP.Image Word8
-        img = JP.Image size size $ MV.toVector $
+    arr <- MM.freeze (M.ParN 0) marr :: IO (M.Array M.P M.Ix3 Float)
+
+    putStrLn "Froze array..."
+
+    let keyframes :: [M.Array M.M M.Ix2 Float]
+        keyframes = [in3d M.!> d | d <- [0 .. numkeyframes - 1]]
+
+        in3d :: M.Array M.P M.Ix3 Float
+        in3d =
             M.computeProxy (Proxy :: Proxy M.P) $
-            fmap floatToWord8 $
             fmap curvy $
             treshold r0 $ normalize $
             M.delay arr
 
-    either fail id $ JP.writeGifImageWithPalette "massiv.gif" img palette
+        frames :: [JP.Image Word8]
+        frames =
+            [ JP.Image width height $ MV.toVector $
+                M.computeProxy (Proxy :: Proxy M.P) $
+                fmap floatToWord8 frame
+            | frame <- interpolateFrames nonkeyframes (map M.delay keyframes)
+            ]
+
+    either fail id $ JP.writeComplexGifImage "massiv.gif" JP.GifEncode
+        { JP.geWidth      = width
+        , JP.geHeight     = height
+        , JP.gePalette    = Just palette
+        , JP.geBackground = Nothing
+        , JP.geLooping    = JP.LoopingForever
+        , JP.geFrames     = do
+            frame <- frames
+            return JP.GifFrame
+                { JP.gfXOffset     = 0
+                , JP.gfYOffset     = 0
+                , JP.gfPalette     = Nothing
+                , JP.gfTransparent = Nothing
+                , JP.gfDelay       = delay
+                , JP.gfDisposal    = JP.DisposalDoNot
+                , JP.gfPixels      = frame
+                }
+        }
     JP.writePng "palette.png" palette
