@@ -3,16 +3,20 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 module Main where
 
-import           Control.Monad             (replicateM)
-import           Control.Monad.ST          (runST)
-import           Data.List                 (foldl')
-import qualified Data.Massiv.Array         as M
-import qualified Data.Massiv.Array.IO      as MIO
-import qualified Data.Massiv.Array.Mutable as MM
-import           Data.Maybe                (fromMaybe)
-import           Data.Proxy                (Proxy (..))
-import qualified Graphics.ColorSpace.RGB   as RGB
-import qualified Test.QuickCheck           as QC
+import qualified Codec.Picture.Gif                 as JP
+import qualified Codec.Picture.Types               as JP
+import           Control.Monad                     (replicateM)
+import           Control.Monad.ST                  (runST)
+import           Data.List                         (foldl')
+import qualified Data.Massiv.Array                 as M
+import qualified Data.Massiv.Array.IO              as MIO
+import qualified Data.Massiv.Array.Manifest.Vector as MV
+import qualified Data.Massiv.Array.Mutable         as MM
+import           Data.Maybe                        (fromMaybe)
+import           Data.Proxy                        (Proxy (..))
+import           Data.Word                         (Word8)
+import qualified Graphics.ColorSpace.RGB           as RGB
+import qualified Test.QuickCheck                   as QC
 
 newtype Radius   = Radius   {unRadius   :: Float}
 newtype Distance = Distance {unDistance :: Float}
@@ -152,6 +156,25 @@ interpolate (RGB.PixelRGB r0 g0 b0) (RGB.PixelRGB r1 g1 b1) t = RGB.PixelRGB
     (g0 * (1.0 - t) + g1 * t)
     (b0 * (1.0 - t) + b1 * t)
 
+floatToWord8 :: Float -> Word8
+floatToWord8 = fromIntegral . round . (* 255)
+
+palette :: JP.Palette
+palette = JP.generateImage
+    (\x _ -> JP.convertPixel $ interpolate blue white $ fromIntegral x)
+    256
+    1
+  where
+
+    blue  = JP.PixelRGBF 0.0 0.6 1.0
+    white = JP.PixelRGBF 1.0 1.0 1.0
+
+    interpolate :: JP.PixelRGBF -> JP.PixelRGBF -> Float -> JP.PixelRGB8
+    interpolate (JP.PixelRGBF r0 g0 b0) (JP.PixelRGBF r1 g1 b1) t = JP.PixelRGB8
+        (floatToWord8 (r0 * (1.0 - t) + r1 * t))
+        (floatToWord8 (g0 * (1.0 - t) + g1 * t))
+        (floatToWord8 (b0 * (1.0 - t) + b1 * t))
+
 main :: IO ()
 main = do
     let fsize   = 3 * size :: Int
@@ -174,8 +197,12 @@ main = do
     marr   <- MM.makeMArray (M.ParN 0) (M.Sz (M.pureIndex size)) (\_ -> pure 0)
     mapM_ (drawPulse marr shape) $ map (offset off) $ filter relevant pulses
     arr <- MM.freeze (M.ParN 0) marr :: IO (M.Array M.P M.Ix2 Float)
-    MIO.writeImageAuto "massiv.png" $
-        fmap (interpolate blue white) $
-        fmap curvy $
-        treshold r0 $ normalize $
-        M.delay arr
+    let img :: JP.Image Word8
+        img = JP.Image size size $ MV.toVector $
+            M.computeProxy (Proxy :: Proxy M.P) $
+            fmap floatToWord8 $
+            fmap curvy $
+            treshold r0 $ normalize $
+            M.delay arr
+
+    either fail id $ JP.writeGifImageWithPalette "massiv.gif" img palette
