@@ -200,12 +200,12 @@ interpolateFrames num (x : y : ys) =
 
 main :: IO ()
 main = do
-    let numkeyframes =   3
-        nonkeyframes =  24
+    let numkeyframes =  12
+        nonkeyframes =  12
         delay        =   4
 
-        height   = 100
-        width    = 200
+        height   =  50
+        width    = 100
         small    = M.Ix3 numkeyframes height width
         big      = small .+. small .+. small
         off      = small
@@ -226,9 +226,9 @@ main = do
     gen <- MWC.createSystemRandom
 
     pulses <- replicateM npulses $ arbitraryPulse gen alpha big
-    marr   <- MM.makeMArray (M.ParN 0) (M.Sz small) (\_ -> pure 0)
+    marr   <- MM.makeMArray M.Seq (M.Sz small) (\_ -> pure 0)
     mapM_ (drawPulse marr shape) $ map (offset off) $ filter relevant pulses
-    arr <- MM.freeze (M.ParN 0) marr :: IO (M.Array M.P M.Ix3 Float)
+    arr <- MM.freeze M.Seq marr :: IO (M.Array M.P M.Ix3 Float)
 
     putStrLn "Froze array..."
 
