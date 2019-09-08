@@ -4,6 +4,7 @@
 module Main where
 
 import qualified Codec.Picture.Gif                 as JP
+import qualified Codec.Picture.Png                 as JP
 import qualified Codec.Picture.Types               as JP
 import           Control.Monad                     (replicateM)
 import           Control.Monad.ST                  (runST)
@@ -12,7 +13,7 @@ import qualified Data.Massiv.Array                 as M
 import qualified Data.Massiv.Array.IO              as MIO
 import qualified Data.Massiv.Array.Manifest.Vector as MV
 import qualified Data.Massiv.Array.Mutable         as MM
-import           Data.Maybe                        (fromMaybe)
+import           Data.Maybe                        (fromMaybe, listToMaybe)
 import           Data.Proxy                        (Proxy (..))
 import           Data.Word                         (Word8)
 import qualified Graphics.ColorSpace.RGB           as RGB
@@ -51,10 +52,13 @@ distance :: M.Index ix => ix -> ix -> Distance
 distance i j = Distance . sqrt . fromIntegral .  M.foldlIndex (+) 0 $
     M.liftIndex2 (\p s -> (p - s) * (p - s)) i j
 
-bounds :: M.Index ix => HPulse ix -> (ix, ix)
-bounds hp =
-    -- TODO (jaspervdj): box calculation
-    let radIdx = M.pureIndex . ceiling . (* 1.5) . unRadius $ hpRadius hp
+bounds :: M.Index ix => PulseShape -> HPulse ix -> (ix, ix)
+bounds shape hp =
+    let bound = fromMaybe 0.0 . listToMaybe .
+            dropWhile ((>= 0.1e-10) . pulseAt shape (hpRadius hp) . Distance) .
+            iterate succ . unRadius $ hpRadius hp
+
+        radIdx = M.pureIndex $ ceiling bound
         start  = hpCenter hp .-. radIdx
         end    = hpCenter hp .+. radIdx .+. unit in
     (start, end)
@@ -84,10 +88,10 @@ data PulseShape
     | Smooth Float    -- s
     | Annuli Float Float  -- lambda, s
 
-pulseAt :: PulseShape -> Distance -> Radius -> Float
-pulseAt Rectangular       (Distance u) (Radius r) = if u <= r then 1.0 else 0.0
-pulseAt (Smooth s)        (Distance u) (Radius r) = exp (-(u / r) ** (2 * s))
-pulseAt (Annuli lambda s) (Distance u) (Radius r) =
+pulseAt :: PulseShape -> Radius -> Distance -> Float
+pulseAt Rectangular       (Radius r) (Distance u) = if u <= r then 1.0 else 0.0
+pulseAt (Smooth s)        (Radius r) (Distance u) = exp (-(u / r) ** (2 * s))
+pulseAt (Annuli lambda s) (Radius r) (Distance u) =
     let lambda' = sqrt (lambda * lambda - 1.0)
         delta   = (lambda + lambda') / 2.0
         sigma   = (lambda - lambda') / 2.0 in
@@ -102,10 +106,10 @@ drawPulse
 drawPulse marr shape pulse = M.iterM_ i0 end unit (<) $ \i -> MM.modifyM
     marr
     (\x -> pure $
-        x + pulseAt shape (distance i (hpCenter pulse)) (hpRadius pulse))
+        x + pulseAt shape (hpRadius pulse) (distance i (hpCenter pulse)))
     i
   where
-    pulseBounds = bounds pulse
+    pulseBounds = bounds shape pulse
     marrBounds  = (M.pureIndex 0, M.unSz (M.msize marr))
     (i0, end)   = intersection pulseBounds marrBounds
     -- bimap repair repair $ bounds pulse :: (ix, ix)
@@ -157,11 +161,11 @@ interpolate (RGB.PixelRGB r0 g0 b0) (RGB.PixelRGB r1 g1 b1) t = RGB.PixelRGB
     (b0 * (1.0 - t) + b1 * t)
 
 floatToWord8 :: Float -> Word8
-floatToWord8 = fromIntegral . round . (* 255)
+floatToWord8 = round . (* 255)
 
 palette :: JP.Palette
 palette = JP.generateImage
-    (\x _ -> JP.convertPixel $ interpolate blue white $ fromIntegral x)
+    (\x _ -> interpolate blue white $ fromIntegral x / 255.0)
     256
     1
   where
@@ -180,11 +184,12 @@ main = do
     let fsize   = 3 * size :: Int
         size    = 400
         off     = 400
-        shape   = Smooth 2
-        v       = 10
+        -- shape   = Annuli 1.1 2
+        shape   = Smooth 8
+        v       = 3 -- 10
         npulses = size * size * v
         alpha   = 5 / 3
-        r0      = 0.7
+        r0      = 0.5
 
         blue  = RGB.PixelRGB 0.0 0.6 1.0
         white = RGB.PixelRGB 1.0 1.0 1.0
@@ -206,3 +211,4 @@ main = do
             M.delay arr
 
     either fail id $ JP.writeGifImageWithPalette "massiv.gif" img palette
+    JP.writePng "palette.png" palette
