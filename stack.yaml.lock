@@ -61,6 +61,27 @@ packages:
   original:
     hackage: llvm-hs-pure-8.0.0
 - completed:
+    hackage: massiv-0.4.1.0@sha256:11aee35ddf64adcbfaceefab7d34feaa10d4fa282247018132ee7417b2395b74,4401
+    pantry-tree:
+      size: 3782
+      sha256: 4bebbe23112dad70c14d812235d77c43016a14c1814cbdeb6530b2b5b5e6e63d
+  original:
+    hackage: massiv-0.4.1.0
+- completed:
+    hackage: massiv-io-0.1.6.0@sha256:de470775334e1ad1d233cf02ad06ad7155f5c34e22a2e1cc99ce5ac19767e6a2,2305
+    pantry-tree:
+      size: 1378
+      sha256: 393ebbd16831473405c85b39de70414b765f56a970bf885d01c357d207df763d
+  original:
+    hackage: massiv-io-0.1.6.0
+- completed:
+    hackage: scheduler-1.4.2@sha256:bad577cefa39840f2f09c43b900868ad7d2d5d50e24d014e1d5087044a4394c3,2888
+    pantry-tree:
+      size: 838
+      sha256: 1e99e36b4624515456e1284d27be7de9a55e1c25d27df3f07eb56a2518b72600
+  original:
+    hackage: scheduler-1.4.2
+- completed:
     hackage: tasty-hedgehog-1.0.0.1@sha256:cdcf60a29195bd0d819d3018c11db2e0deb7c6e559ad940c49409a5a7a982f83,1766
     pantry-tree:
       size: 330
