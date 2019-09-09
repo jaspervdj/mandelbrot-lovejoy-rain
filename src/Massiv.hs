@@ -2,44 +2,37 @@
 {-# LANGUAGE DeriveFunctor       #-}
 {-# LANGUAGE FlexibleContexts    #-}
 {-# LANGUAGE FlexibleInstances   #-}
+{-# LANGUAGE RecordWildCards     #-}
 {-# LANGUAGE ScopedTypeVariables #-}
-module Main where
+module Main
+    ( main
+    ) where
 
 import qualified Codec.Picture.Gif                 as JP
-import qualified Codec.Picture.Png                 as JP
 import qualified Codec.Picture.Types               as JP
 import qualified Control.Concurrent.MVar           as MVar
-import           Control.Monad                     (foldM, replicateM)
-import System.IO.Unsafe (unsafeInterleaveIO)
+import           Control.Monad                     (foldM, replicateM_, when)
 import           Control.Monad.Primitive           (PrimMonad (..))
 import           Control.Monad.ST                  (runST)
 import           Data.Bool                         (bool)
 import qualified Data.IORef                        as IORef
-import           Data.List                         (foldl')
 import qualified Data.Massiv.Array                 as M
-import qualified Data.Massiv.Array.IO              as MIO
 import qualified Data.Massiv.Array.Manifest.Vector as MV
 import qualified Data.Massiv.Array.Mutable         as MM
+import qualified Data.Massiv.Array.Unsafe          as M
 import           Data.Maybe                        (fromMaybe, listToMaybe)
 import           Data.Proxy                        (Proxy (..))
 import           Data.Word                         (Word8)
-import qualified Graphics.ColorSpace.RGB           as RGB
 import qualified System.IO                         as IO
 import qualified System.Random.MWC                 as MWC
 
 newtype Radius   = Radius   {unRadius   :: Float}
-newtype Distance = Distance {unDistance :: Float}
-
-data Pulse = Pulse
-    { pCenter    :: (Float, Float)
-    , pAmplitude :: Float
-    , pRadius    :: Radius
-    }
+newtype Distance = Distance Float
 
 data HPulse ix = HPulse
-    { hpCenter    :: !ix
-    , hpAmplitude :: !Float
-    , hpRadius    :: !Radius
+    { hpCenter :: !ix
+    , hpAmp    :: !Float
+    , hpRadius :: !Radius
     }
 
 unit :: M.Index ix => ix
@@ -73,8 +66,8 @@ bounds shape hp =
 
 arbitraryIndex
     :: forall m ix. (PrimMonad m, M.MonadThrow m, M.Index ix)
-    => MWC.Gen (PrimState m) -> ix -> m ix
-arbitraryIndex gen choice =
+    => MWC.Gen (PrimState m) -> M.Sz ix -> m ix
+arbitraryIndex gen (M.Sz choice) =
     foldM
         (\acc dim -> do
             up <- M.getDimM choice (M.Dim dim)
@@ -85,7 +78,7 @@ arbitraryIndex gen choice =
 
 arbitraryPulse
     :: forall m ix. (PrimMonad m, M.MonadThrow m, M.Index ix)
-    => MWC.Gen (PrimState m) -> Float -> ix -> m (HPulse ix)
+    => MWC.Gen (PrimState m) -> Float -> M.Sz ix -> m (HPulse ix)
 arbitraryPulse gen alpha area = do
     center <- arbitraryIndex gen area
     rhoInv <- MWC.uniformR (0.0, 1.0) gen
@@ -94,11 +87,6 @@ arbitraryPulse gen alpha area = do
         amp    = rho ** (1.0 / alpha)
     ampSign <- bool (-1.0) 1.0 <$> MWC.uniform gen
     return $ HPulse center (ampSign * amp) (Radius radius)
-
-data PulseShape
-    = Rectangular
-    | Smooth Float    -- s
-    | Annuli Float Float  -- lambda, s
 
 pulseAt :: PulseShape -> Radius -> Distance -> Float
 pulseAt Rectangular       (Radius r) (Distance u) = if u <= r then 1.0 else 0.0
@@ -109,23 +97,52 @@ pulseAt (Annuli lambda s) (Radius r) (Distance u) =
         sigma   = (lambda - lambda') / 2.0 in
     exp (-(((u*u) / (r*r) - (delta*delta)) / (sigma*sigma)) ** (2 * s))
 
-drawPulse
+addPulse
     :: forall ix r m. (MM.Mutable r ix Float, M.PrimMonad m, M.MonadThrow m)
     => MM.MArray (M.PrimState m) r ix Float
     -> PulseShape
     -> HPulse ix
     -> m ()
-drawPulse marr shape pulse = M.iterM_ i0 end unit (<) $ \i -> MM.modifyM
-    marr
-    (\x -> pure $
-        x + pulseAt shape (hpRadius pulse) (distance i (hpCenter pulse)))
-    i
+addPulse marr shape pulse@HPulse {..} = M.iterM_ i0 end unit (<) $ \i ->
+    MM.modifyM
+        marr
+        (\x -> pure $ x + hpAmp * pulseAt shape hpRadius (distance i hpCenter))
+        i
   where
     pulseBounds = bounds shape pulse
     marrBounds  = (M.pureIndex 0, M.unSz (M.msize marr))
     (i0, end)   = intersection pulseBounds marrBounds
-    -- bimap repair repair $ bounds pulse :: (ix, ix)
-{-# INLINE drawPulse #-}
+{-# INLINE addPulse #-}
+
+data FractalParams ix = FractalParams
+    { fpWorld      :: M.Sz ix
+    , fpCropOffset :: ix
+    , fpCropSize   :: M.Sz ix
+    , fpNumPulses  :: Int
+    , fpAlpha      :: Float
+    , fpPulseShape :: PulseShape
+    , fpRhoIn      :: Float
+    , fpRhoOut     :: Float
+    }
+
+data PulseShape
+    = Rectangular
+    | Smooth Float    -- s
+    | Annuli Float Float  -- lambda, s
+
+makeFractal
+    :: (M.Index ix, PrimMonad m, M.MonadThrow m)
+    => FractalParams ix
+    -> MWC.Gen (PrimState m)
+    -> m (M.Array M.P ix Float)
+makeFractal FractalParams {..} gen = do
+    marr <- MM.new fpCropSize
+    replicateM_ fpNumPulses $ do
+        pulse <- offset fpCropOffset <$> arbitraryPulse gen fpAlpha fpWorld
+        when (relevant pulse) $ addPulse marr fpPulseShape pulse
+    M.unsafeFreeze M.Seq marr
+  where
+    relevant = (\r -> r >= fpRhoIn && r <= fpRhoOut) . unRadius . hpRadius
 
 normalize
     :: (Functor (M.Array r ix), M.Source r ix Float)
@@ -213,40 +230,40 @@ divideWork total jobs = M.fromList M.Seq $
     let (items, remainder) = total `divMod` jobs in
     zipWith (+) (replicate remainder 1 ++ repeat 0) (replicate jobs items)
 
-lazyReplicateM :: Int -> IO a -> IO [a]
-lazyReplicateM n mx
-    | n <= 0    = return []
-    | otherwise = do
-        x  <- unsafeInterleaveIO mx
-        xs <- unsafeInterleaveIO $ lazyReplicateM (n - 1) mx
-        return (x : xs)
-
 main :: IO ()
 main = do
-    let numkeyframes = 12
+    let numkeyframes =  6
         nonkeyframes = 12
         delay        =  4
 
-        height   = 200
-        width    = 300
+        height   = 100
+        width    = 150
         small    = M.Ix3 numkeyframes height width
-        big      = small .+. small .+. small
-        off      = small
+        world    = small .+. small .+. small
 
         shape   = Annuli 1.1 2
         -- shape   = Smooth 8
         v       = 1
-        npulses = M.totalElem (M.Sz big) * v
+        npulses = M.totalElem (M.Sz world) * v
         alpha   = 5 / 3
         r0      = 0.7
         rho_o   = fromIntegral (max height width) * 1.5
-        rho_i   = fromIntegral $ 3
-
-        relevant = (\r -> r >= rho_i && r <= rho_o) . unRadius . hpRadius
+        rho_i   = 3
 
         curvy x = 1 - (1 -  x) * (1 - x) * (1 - x)
 
-        jobs = 64
+        fp = FractalParams
+            { fpWorld      = M.Sz world
+            , fpCropOffset = small
+            , fpCropSize   = M.Sz small
+            , fpNumPulses  = npulses
+            , fpAlpha      = alpha
+            , fpPulseShape = shape
+            , fpRhoIn      = rho_i
+            , fpRhoOut     = rho_o
+            }
+
+        jobs = 32
 
     -- Logging
     lock <- MVar.newMVar ()
@@ -254,19 +271,13 @@ main = do
 
     -- Generate some reusable zeroes.
     logger "Generating zeroes..."
-    zeroes <- M.generateArrayS (M.Sz small) (\_ -> pure 0) :: IO (M.Array M.P M.Ix3 Float)
+    let zeroes = M.replicate M.Seq (M.Sz small) 0 :: M.Array M.P M.Ix3 Float
 
     -- Draw the array in `stride` strides.
-    partsDone <- IORef.newIORef 0
+    partsDone <- IORef.newIORef (0 :: Int)
     parts     <- M.forIO (M.setComp M.Par $ divideWork npulses jobs) $ \items -> do
-        gen <- MWC.createSystemRandom
-        pulses <-
-            fmap (map (offset off) . filter relevant) $
-            lazyReplicateM items (arbitraryPulse gen alpha big)
-        logger $ "Got pulse..."
-        marr <- MM.thaw zeroes
-        mapM_ (drawPulse marr shape) pulses
-        arr  <- MM.freeze M.Seq marr :: IO (M.Array M.P M.Ix3 Float)
+        gen  <- MWC.createSystemRandom
+        arr  <- makeFractal fp {fpNumPulses = items} gen
         done <- IORef.atomicModifyIORef' partsDone $ \n -> (succ n, succ n)
         logger $ "Finished job " ++ show done ++ "/" ++ show jobs
         return arr
