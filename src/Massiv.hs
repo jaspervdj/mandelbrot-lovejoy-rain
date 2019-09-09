@@ -26,14 +26,15 @@ import           Data.Word                         (Word8)
 import qualified System.IO                         as IO
 import qualified System.Random.MWC                 as MWC
 
+--------------------------------------------------------------------------------
+-- Utility types.
+
 newtype Radius   = Radius   {unRadius   :: Float}
 newtype Distance = Distance Float
 
-data HPulse ix = HPulse
-    { hpCenter :: !ix
-    , hpAmp    :: !Float
-    , hpRadius :: !Radius
-    }
+
+--------------------------------------------------------------------------------
+-- Utilities for dimension-generic algorithms.
 
 unit :: M.Index ix => ix
 unit = M.pureIndex 1
@@ -53,16 +54,15 @@ distance :: M.Index ix => ix -> ix -> Distance
 distance i j = Distance . sqrt . fromIntegral .  M.foldlIndex (+) 0 $
     M.liftIndex2 (\p s -> (p - s) * (p - s)) i j
 
-bounds :: M.Index ix => PulseShape -> HPulse ix -> (ix, ix)
-bounds shape hp =
-    let bound = fromMaybe 0.0 . listToMaybe .
-            dropWhile ((>= 0.1e-10) . pulseAt shape (hpRadius hp) . Distance) .
-            iterate succ . unRadius $ hpRadius hp
 
-        radIdx = M.pureIndex $ ceiling bound
-        start  = hpCenter hp .-. radIdx
-        end    = hpCenter hp .+. radIdx .+. unit in
-    (start, end)
+--------------------------------------------------------------------------------
+-- Generating pulses
+
+data HPulse ix = HPulse
+    { hpCenter :: !ix
+    , hpAmp    :: !Float
+    , hpRadius :: !Radius
+    }
 
 arbitraryIndex
     :: forall m ix. (PrimMonad m, M.MonadThrow m, M.Index ix)
@@ -88,6 +88,15 @@ arbitraryPulse gen alpha area = do
     ampSign <- bool (-1.0) 1.0 <$> MWC.uniform gen
     return $ HPulse center (ampSign * amp) (Radius radius)
 
+
+--------------------------------------------------------------------------------
+-- Drawing pulses
+
+data PulseShape
+    = Rectangular
+    | Smooth Float    -- s
+    | Annuli Float Float  -- lambda, s
+
 pulseAt :: PulseShape -> Radius -> Distance -> Float
 pulseAt Rectangular       (Radius r) (Distance u) = if u <= r then 1.0 else 0.0
 pulseAt (Smooth s)        (Radius r) (Distance u) = exp (-(u / r) ** (2 * s))
@@ -96,6 +105,17 @@ pulseAt (Annuli lambda s) (Radius r) (Distance u) =
         delta   = (lambda + lambda') / 2.0
         sigma   = (lambda - lambda') / 2.0 in
     exp (-(((u*u) / (r*r) - (delta*delta)) / (sigma*sigma)) ** (2 * s))
+
+bounds :: M.Index ix => PulseShape -> HPulse ix -> (ix, ix)
+bounds shape hp =
+    let bound = fromMaybe 0.0 . listToMaybe .
+            dropWhile ((>= 0.1e-6) . pulseAt shape (hpRadius hp) . Distance) .
+            iterate succ . unRadius $ hpRadius hp
+
+        radIdx = M.pureIndex $ ceiling bound
+        start  = hpCenter hp .-. radIdx
+        end    = hpCenter hp .+. radIdx .+. unit in
+    (start, end)
 
 addPulse
     :: forall ix r m. (MM.Mutable r ix Float, M.PrimMonad m, M.MonadThrow m)
@@ -114,6 +134,10 @@ addPulse marr shape pulse@HPulse {..} = M.iterM_ i0 end unit (<) $ \i ->
     (i0, end)   = intersection pulseBounds marrBounds
 {-# INLINE addPulse #-}
 
+
+--------------------------------------------------------------------------------
+-- Generating the fractal.
+
 data FractalParams ix = FractalParams
     { fpWorld      :: M.Sz ix
     , fpCropOffset :: ix
@@ -124,11 +148,6 @@ data FractalParams ix = FractalParams
     , fpRhoIn      :: Float
     , fpRhoOut     :: Float
     }
-
-data PulseShape
-    = Rectangular
-    | Smooth Float    -- s
-    | Annuli Float Float  -- lambda, s
 
 makeFractal
     :: (M.Index ix, PrimMonad m, M.MonadThrow m)
@@ -143,6 +162,9 @@ makeFractal FractalParams {..} gen = do
     M.unsafeFreeze M.Seq marr
   where
     relevant = (\r -> r >= fpRhoIn && r <= fpRhoOut) . unRadius . hpRadius
+
+--------------------------------------------------------------------------------
+-- | Post-processing utilities.
 
 normalize
     :: (Functor (M.Array r ix), M.Source r ix Float)
@@ -232,38 +254,30 @@ divideWork total jobs = M.fromList M.Seq $
 
 main :: IO ()
 main = do
-    let numkeyframes =  6
+    let jobs         = 32
+        numkeyframes =  6
         nonkeyframes = 12
         delay        =  4
 
         height   = 100
         width    = 150
         small    = M.Ix3 numkeyframes height width
-        world    = small .+. small .+. small
+        world    = M.Sz (small .+. small .+. small)
 
-        shape   = Annuli 1.1 2
-        -- shape   = Smooth 8
         v       = 1
-        npulses = M.totalElem (M.Sz world) * v
-        alpha   = 5 / 3
+        npulses = M.totalElem world * v
         r0      = 0.7
-        rho_o   = fromIntegral (max height width) * 1.5
-        rho_i   = 3
-
-        curvy x = 1 - (1 -  x) * (1 - x) * (1 - x)
 
         fp = FractalParams
-            { fpWorld      = M.Sz world
+            { fpWorld      = world
             , fpCropOffset = small
             , fpCropSize   = M.Sz small
             , fpNumPulses  = npulses
-            , fpAlpha      = alpha
-            , fpPulseShape = shape
-            , fpRhoIn      = rho_i
-            , fpRhoOut     = rho_o
+            , fpAlpha      = 5 / 3
+            , fpPulseShape = Annuli 1.1 2
+            , fpRhoIn      = 3
+            , fpRhoOut     = fromIntegral (max height width) * 1.5
             }
-
-        jobs = 32
 
     -- Logging
     lock <- MVar.newMVar ()
@@ -284,22 +298,16 @@ main = do
 
     -- Join the different strides.
     logger $ "Joining strides..."
-    let drawn :: M.Array M.P M.Ix3 Float
-        !drawn =
-            M.compute $ M.setComp (M.ParN 0) $
-            unSum $ M.foldSemi (Sum . M.delay) (Sum (M.delay zeroes))
+    let cube :: M.Array M.P M.Ix3 Float
+        cube =
+            M.computeProxy (Proxy :: Proxy M.P) .
+            treshold r0 . normalize .
+            unSum . M.foldSemi (Sum . M.delay) (Sum (M.delay zeroes)) $
             (parts :: M.Array M.B M.Ix1 (M.Array M.P M.Ix3 Float))
 
     logger "Generating keyframes..."
     let keyframes :: [M.Array M.M M.Ix2 Float]
-        keyframes = [in3d M.!> d | d <- [0 .. numkeyframes - 1]]
-
-        in3d :: M.Array M.P M.Ix3 Float
-        in3d =
-            M.computeProxy (Proxy :: Proxy M.P) $
-            fmap curvy $
-            treshold r0 $ normalize $
-            M.delay drawn
+        keyframes = [cube M.!> d | d <- [0 .. numkeyframes - 1]]
 
         frames :: [JP.Image Word8]
         frames =
