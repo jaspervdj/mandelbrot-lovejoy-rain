@@ -1,15 +1,20 @@
+{-# LANGUAGE BangPatterns        #-}
 {-# LANGUAGE DeriveFunctor       #-}
 {-# LANGUAGE FlexibleContexts    #-}
+{-# LANGUAGE FlexibleInstances   #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 module Main where
 
 import qualified Codec.Picture.Gif                 as JP
 import qualified Codec.Picture.Png                 as JP
 import qualified Codec.Picture.Types               as JP
+import qualified Control.Concurrent.MVar           as MVar
 import           Control.Monad                     (foldM, replicateM)
+import System.IO.Unsafe (unsafeInterleaveIO)
 import           Control.Monad.Primitive           (PrimMonad (..))
 import           Control.Monad.ST                  (runST)
 import           Data.Bool                         (bool)
+import qualified Data.IORef                        as IORef
 import           Data.List                         (foldl')
 import qualified Data.Massiv.Array                 as M
 import qualified Data.Massiv.Array.IO              as MIO
@@ -19,6 +24,7 @@ import           Data.Maybe                        (fromMaybe, listToMaybe)
 import           Data.Proxy                        (Proxy (..))
 import           Data.Word                         (Word8)
 import qualified Graphics.ColorSpace.RGB           as RGB
+import qualified System.IO                         as IO
 import qualified System.Random.MWC                 as MWC
 
 newtype Radius   = Radius   {unRadius   :: Float}
@@ -31,9 +37,9 @@ data Pulse = Pulse
     }
 
 data HPulse ix = HPulse
-    { hpCenter    :: ix
-    , hpAmplitude :: Float
-    , hpRadius    :: Radius
+    { hpCenter    :: !ix
+    , hpAmplitude :: !Float
+    , hpRadius    :: !Radius
     }
 
 unit :: M.Index ix => ix
@@ -197,15 +203,32 @@ interpolateFrames num (x : y : ys) =
   where
     spacing = 1.0 / fromIntegral (num + 1)
 
+newtype Sum r ix a = Sum {unSum :: M.Array r ix a}
+
+instance (M.Index ix, Num a) => Semigroup (Sum M.D ix a) where
+    Sum x <> Sum y = Sum (M.zipWith (+) x y)
+
+divideWork :: Int -> Int -> M.Array M.P M.Ix1 Int
+divideWork total jobs = M.fromList M.Seq $
+    let (items, remainder) = total `divMod` jobs in
+    zipWith (+) (replicate remainder 1 ++ repeat 0) (replicate jobs items)
+
+lazyReplicateM :: Int -> IO a -> IO [a]
+lazyReplicateM n mx
+    | n <= 0    = return []
+    | otherwise = do
+        x  <- unsafeInterleaveIO mx
+        xs <- unsafeInterleaveIO $ lazyReplicateM (n - 1) mx
+        return (x : xs)
 
 main :: IO ()
 main = do
-    let numkeyframes =  12
-        nonkeyframes =  12
-        delay        =   4
+    let numkeyframes = 12
+        nonkeyframes = 12
+        delay        =  4
 
-        height   =  50
-        width    = 100
+        height   = 200
+        width    = 300
         small    = M.Ix3 numkeyframes height width
         big      = small .+. small .+. small
         off      = small
@@ -223,15 +246,40 @@ main = do
 
         curvy x = 1 - (1 -  x) * (1 - x) * (1 - x)
 
-    gen <- MWC.createSystemRandom
+        jobs = 64
 
-    pulses <- replicateM npulses $ arbitraryPulse gen alpha big
-    marr   <- MM.makeMArray M.Seq (M.Sz small) (\_ -> pure 0)
-    mapM_ (drawPulse marr shape) $ map (offset off) $ filter relevant pulses
-    arr <- MM.freeze M.Seq marr :: IO (M.Array M.P M.Ix3 Float)
+    -- Logging
+    lock <- MVar.newMVar ()
+    let logger = MVar.modifyMVar_ lock . const . IO.hPutStrLn IO.stderr
 
-    putStrLn "Froze array..."
+    -- Generate some reusable zeroes.
+    logger "Generating zeroes..."
+    zeroes <- M.generateArrayS (M.Sz small) (\_ -> pure 0) :: IO (M.Array M.P M.Ix3 Float)
 
+    -- Draw the array in `stride` strides.
+    partsDone <- IORef.newIORef 0
+    parts     <- M.forIO (M.setComp M.Par $ divideWork npulses jobs) $ \items -> do
+        gen <- MWC.createSystemRandom
+        pulses <-
+            fmap (map (offset off) . filter relevant) $
+            lazyReplicateM items (arbitraryPulse gen alpha big)
+        logger $ "Got pulse..."
+        marr <- MM.thaw zeroes
+        mapM_ (drawPulse marr shape) pulses
+        arr  <- MM.freeze M.Seq marr :: IO (M.Array M.P M.Ix3 Float)
+        done <- IORef.atomicModifyIORef' partsDone $ \n -> (succ n, succ n)
+        logger $ "Finished job " ++ show done ++ "/" ++ show jobs
+        return arr
+
+    -- Join the different strides.
+    logger $ "Joining strides..."
+    let drawn :: M.Array M.P M.Ix3 Float
+        !drawn =
+            M.compute $ M.setComp (M.ParN 0) $
+            unSum $ M.foldSemi (Sum . M.delay) (Sum (M.delay zeroes))
+            (parts :: M.Array M.B M.Ix1 (M.Array M.P M.Ix3 Float))
+
+    logger "Generating keyframes..."
     let keyframes :: [M.Array M.M M.Ix2 Float]
         keyframes = [in3d M.!> d | d <- [0 .. numkeyframes - 1]]
 
@@ -240,7 +288,7 @@ main = do
             M.computeProxy (Proxy :: Proxy M.P) $
             fmap curvy $
             treshold r0 $ normalize $
-            M.delay arr
+            M.delay drawn
 
         frames :: [JP.Image Word8]
         frames =
