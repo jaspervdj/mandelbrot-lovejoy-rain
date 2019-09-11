@@ -22,9 +22,10 @@ Executable mlr-massiv
   Default-language: Haskell2010
 
   Build-depends:
-    base        >= 4.7  && < 5,
     JuicyPixels >= 3.3  && < 3.4,
+    base        >= 4.7  && < 5,
     massiv      >= 0.4  && < 0.5,
     massiv-io   >= 0.1  && < 0.2,
     mwc-random  >= 0.14 && < 1.15,
-    primitive   >= 0.6  && < 0.7
+    primitive   >= 0.6  && < 0.7,
+    scheduler   >= 1.4  && < 1.5

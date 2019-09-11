@@ -1,4 +1,3 @@
-{-# LANGUAGE BangPatterns        #-}
 {-# LANGUAGE DeriveFunctor       #-}
 {-# LANGUAGE FlexibleContexts    #-}
 {-# LANGUAGE FlexibleInstances   #-}
@@ -10,17 +9,23 @@ module Main
 
 import qualified Codec.Picture.Gif                 as JP
 import qualified Codec.Picture.Types               as JP
+import           Control.Concurrent                (forkIO)
+import qualified Control.Concurrent.Chan           as Chan
 import qualified Control.Concurrent.MVar           as MVar
-import           Control.Monad                     (foldM, replicateM_, when)
+import           Control.Monad                     (foldM, forM_, replicateM_,
+                                                    when)
 import           Control.Monad.Primitive           (PrimMonad (..))
 import           Control.Monad.ST                  (runST)
+import qualified Control.Scheduler                 as Scheduler
 import           Data.Bool                         (bool)
 import qualified Data.IORef                        as IORef
+import           Data.List                         (foldl')
 import qualified Data.Massiv.Array                 as M
 import qualified Data.Massiv.Array.Manifest.Vector as MV
 import qualified Data.Massiv.Array.Mutable         as MM
 import qualified Data.Massiv.Array.Unsafe          as M
-import           Data.Maybe                        (fromMaybe, listToMaybe)
+import           Data.Maybe                        (catMaybes, fromMaybe,
+                                                    isJust, listToMaybe)
 import           Data.Proxy                        (Proxy (..))
 import           Data.Word                         (Word8)
 import qualified System.IO                         as IO
@@ -242,40 +247,35 @@ interpolateFrames num (x : y : ys) =
   where
     spacing = 1.0 / fromIntegral (num + 1)
 
-newtype Sum r ix a = Sum {unSum :: M.Array r ix a}
-
-instance (M.Index ix, Num a) => Semigroup (Sum M.D ix a) where
-    Sum x <> Sum y = Sum (M.zipWith (+) x y)
-
-divideWork :: Int -> Int -> M.Array M.P M.Ix1 Int
-divideWork total jobs = M.fromList M.Seq $
+divideWork :: Int -> Int -> [Int]
+divideWork total jobs =
     let (items, remainder) = total `divMod` jobs in
     zipWith (+) (replicate remainder 1 ++ repeat 0) (replicate jobs items)
 
 main :: IO ()
 main = do
-    let jobs         = 32
-        numkeyframes =  6
-        nonkeyframes = 12
-        delay        =  4
+    let jobs         =  32
+        numkeyframes =   6
+        nonkeyframes =   6
+        delay        =   4
 
         height   = 100
         width    = 150
         small    = M.Ix3 numkeyframes height width
-        world    = M.Sz (small .+. small .+. small)
+        world    = M.Sz (1 .+. small .+. small)
 
         v       = 1
-        npulses = M.totalElem world * v
+        npulses = M.totalElem world * v `div` 5
         r0      = 0.7
 
         fp = FractalParams
             { fpWorld      = world
             , fpCropOffset = small
             , fpCropSize   = M.Sz small
-            , fpNumPulses  = npulses
+            , fpNumPulses  = npulses `div` 20
             , fpAlpha      = 5 / 3
-            , fpPulseShape = Annuli 1.1 2
-            , fpRhoIn      = 3
+            , fpPulseShape = Annuli 1.2 8
+            , fpRhoIn      = 0.0
             , fpRhoOut     = fromIntegral (max height width) * 1.5
             }
 
@@ -288,22 +288,29 @@ main = do
     let zeroes = M.replicate M.Seq (M.Sz small) 0 :: M.Array M.P M.Ix3 Float
 
     -- Draw the array in `stride` strides.
+    partsChan <- Chan.newChan
     partsDone <- IORef.newIORef (0 :: Int)
-    parts     <- M.forIO (M.setComp M.Par $ divideWork npulses jobs) $ \items -> do
-        gen  <- MWC.createSystemRandom
-        arr  <- makeFractal fp {fpNumPulses = items} gen
-        done <- IORef.atomicModifyIORef' partsDone $ \n -> (succ n, succ n)
-        logger $ "Finished job " ++ show done ++ "/" ++ show jobs
-        return arr
+    _         <- forkIO $ do
+        Scheduler.withScheduler_ Scheduler.Par $ \scheduler ->
+            forM_ (divideWork npulses jobs) $ \items ->
+            Scheduler.scheduleWork_ scheduler $ do
+            gen  <- MWC.createSystemRandom
+            arr  <- makeFractal fp {fpNumPulses = items} gen
+            done <- IORef.atomicModifyIORef' partsDone $ \n -> (succ n, succ n)
+            logger $ "Finished job " ++ show done ++ "/" ++ show jobs
+            Chan.writeChan partsChan $ Just arr
+        Chan.writeChan partsChan Nothing
 
     -- Join the different strides.
     logger $ "Joining strides..."
+    parts <- catMaybes . takeWhile isJust <$> Chan.getChanContents partsChan
     let cube :: M.Array M.P M.Ix3 Float
         cube =
             M.computeProxy (Proxy :: Proxy M.P) .
             treshold r0 . normalize .
-            unSum . M.foldSemi (Sum . M.delay) (Sum (M.delay zeroes)) $
-            (parts :: M.Array M.B M.Ix1 (M.Array M.P M.Ix3 Float))
+            M.delay .
+            foldl' (\acc x -> M.computeProxy (Proxy :: Proxy M.P) $ M.zipWith (+) (M.delay acc) x) zeroes $
+            parts
 
     logger "Generating keyframes..."
     let keyframes :: [M.Array M.M M.Ix2 Float]
