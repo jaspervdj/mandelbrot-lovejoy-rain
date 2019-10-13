@@ -10,7 +10,7 @@ module Main
 
 import qualified Codec.Picture.Gif                 as JP
 import qualified Codec.Picture.Types               as JP
-import           Control.Concurrent                (forkIO)
+import           Control.Concurrent                (forkIO, getNumCapabilities)
 import qualified Control.Concurrent.Chan           as Chan
 import qualified Control.Concurrent.MVar           as MVar
 import           Control.Monad                     (foldM, forM, forM_,
@@ -250,11 +250,15 @@ interpolateFrames num (x : y : ys) =
   where
     spacing = 1.0 / fromIntegral (num + 1)
 
-newtype Sum = Sum {unSum :: M.Array M.P M.Ix3 Float}
 
-instance Semigroup Sum where
-    Sum x <> Sum y = Sum $
-        M.computeProxy (Proxy :: Proxy M.P) $ M.zipWith (+) x y
+--------------------------------------------------------------------------------
+-- | Parallellizing the drawing across cores
+
+newtype Sum ix = Sum {unSum :: M.Array M.P ix Float}
+
+instance M.Index ix => Semigroup (Sum ix) where
+    Sum x <> Sum y =
+        Sum $ M.computeProxy (Proxy :: Proxy M.P) $ M.zipWith (+) x y
 
 mapReduce
     :: Monoid b
@@ -285,6 +289,33 @@ divideWork total workers =
     let (items, remainder) = total `divMod` workers in
     zipWith (+) (replicate remainder 1 ++ repeat 0) (replicate workers items)
 
+makeClouds
+    :: M.Index ix
+    => (String -> IO ())   -- ^ Logging
+    -> FractalParams ix    -- ^ Parameters
+    -> IO (M.Array M.P ix Float)
+makeClouds logger fp@FractalParams {..} = do
+    workers <- getNumCapabilities
+    jobs    <- forM (divideWork fpNumPulses workers) $ \items -> do
+        seed <- MWC.withSystemRandom $ MWC.asGenIO $
+            V.replicateM 32 . MWC.uniform
+        return (items :: Int, seed :: V.Vector Word32)
+
+    mbSummed <- mapReduce logger jobs $ \(items, seed) -> runST $ do
+        gen <- MWC.initialize seed
+        Just . Sum <$> makeFractal fp {fpNumPulses = items} gen
+
+    summed <- maybe
+        (fail "Internal error: No results from mapReduce") (return . unSum)
+        mbSummed
+
+    return $ M.computeProxy (Proxy :: Proxy M.P) $
+        fmap scurve $ treshold r0 $
+        normalize $ M.delay summed
+  where
+    r0       = 0.6
+    scurve x = (1 + cos ((x - 1) * pi)) / 2
+
 main :: IO ()
 main = do
     let workers      =  32
@@ -296,16 +327,13 @@ main = do
         width    = 1600
         small    = M.Ix3 numkeyframes height width
         world    = M.Sz (1 .+. small .+. small)
-
-        v       = 1
-        npulses = M.totalElem world * v `div` 5
-        r0      = 0.6
+        v        = 1
 
         fp = FractalParams
             { fpWorld      = world
             , fpCropOffset = small
             , fpCropSize   = M.Sz small
-            , fpNumPulses  = npulses `div` 20
+            , fpNumPulses  = M.totalElem world * v `div` 20
             , fpAlpha      = 5 / 3
             , fpPulseShape = Annuli 1.2 8
             , fpRhoIn      = 0.0
@@ -319,21 +347,9 @@ main = do
     -- Generate some reusable zeroes.
     logger "Generating zeroes..."
     let zeroes = M.replicate M.Seq (M.Sz small) 0 :: M.Array M.P M.Ix3 Float
-
-    jobs <- forM (divideWork npulses workers) $ \items -> do
-        seed <- MWC.withSystemRandom $ MWC.asGenIO $
-            V.replicateM 32 . MWC.uniform
-        return (items :: Int, seed :: V.Vector Word32)
-
-    summed <- mapReduce logger jobs $ \(items, seed) -> runST $ do
-        gen <- MWC.initialize seed
-        Just . Sum <$> makeFractal fp {fpNumPulses = items} gen
-
     let scurve x = (1 + cos ((x - 1) * pi)) / 2
 
-        cuby = M.computeProxy (Proxy :: Proxy M.P) .
-            fmap scurve . treshold r0 . normalize . M.delay $
-            maybe zeroes unSum summed
+    cuby <- makeClouds logger fp
 
     logger "Generating keyframes..."
     let keyframes :: [M.Array M.M M.Ix2 Float]
