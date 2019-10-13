@@ -8,7 +8,6 @@ module Main
     ( main
     ) where
 
-import qualified Codec.Picture                     as JP
 import qualified Codec.Picture.Gif                 as JP
 import qualified Codec.Picture.Types               as JP
 import           Control.Concurrent                (forkIO)
@@ -348,13 +347,10 @@ main = do
             | frame <- interpolateFrames nonkeyframes (map M.delay keyframes)
             ]
 
-    evening <- JP.readImage "evening.png" >>=
-        either fail (return . JP.convertRGB8)
-
     either fail id $ JP.writeComplexGifImage "quick.gif" JP.GifEncode
         { JP.geWidth      = width
         , JP.geHeight     = height
-        , JP.gePalette    = Just evening
+        , JP.gePalette    = Just palette
         , JP.geBackground = Nothing
         , JP.geLooping    = JP.LoopingForever
         , JP.geFrames     = do
@@ -369,3 +365,4 @@ main = do
                 , JP.gfPixels      = frame
                 }
         }
+    -- JP.writePng "palette.png" palette
