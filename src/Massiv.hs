@@ -10,7 +10,7 @@ module Main
 
 import qualified Codec.Picture.Gif                 as JP
 import qualified Codec.Picture.Types               as JP
-import           Control.Concurrent                (forkIO, getNumCapabilities)
+import           Control.Concurrent                (forkIO)
 import qualified Control.Concurrent.Chan           as Chan
 import qualified Control.Concurrent.MVar           as MVar
 import           Control.Monad                     (foldM, forM, forM_,
@@ -155,6 +155,7 @@ data FractalParams ix = FractalParams
     , fpPulseShape :: PulseShape
     , fpRhoIn      :: Float
     , fpRhoOut     :: Float
+    , fpTreshold   :: Float
     }
 
 makeFractal
@@ -254,19 +255,13 @@ interpolateFrames num (x : y : ys) =
 --------------------------------------------------------------------------------
 -- | Parallellizing the drawing across cores
 
-newtype Sum ix = Sum {unSum :: M.Array M.P ix Float}
-
-instance M.Index ix => Semigroup (Sum ix) where
-    Sum x <> Sum y =
-        Sum $ M.computeProxy (Proxy :: Proxy M.P) $ M.zipWith (+) x y
-
 mapReduce
-    :: Monoid b
-    => (String -> IO ())  -- ^ Logger
+    :: (String -> IO ())  -- ^ Logger
     -> [a]                -- ^ Items to process
     -> (a -> b)           -- ^ Map
+    -> (b -> b -> b)      -- ^ Reduce
     -> IO b
-mapReduce logger as f = do
+mapReduce logger as f g = do
     bChan <- Chan.newChan
     bDone <- IORef.newIORef (0 :: Int)
     _     <- forkIO $ do
@@ -280,7 +275,9 @@ mapReduce logger as f = do
         Chan.writeChan bChan Nothing
 
     bs <- catMaybes . takeWhile isJust <$> Chan.getChanContents bChan
-    return $ foldl' (<>) mempty bs
+    case bs of
+        []      -> fail "mapReduce: empty list"
+        bh : bt -> return $ foldl' g bh bt
   where
     num = length as
 
@@ -295,32 +292,58 @@ makeClouds
     -> FractalParams ix    -- ^ Parameters
     -> IO (M.Array M.P ix Float)
 makeClouds logger fp@FractalParams {..} = do
-    workers <- getNumCapabilities
-    jobs    <- forM (divideWork fpNumPulses workers) $ \items -> do
+    jobs <- forM (divideWork fpNumPulses 32) $ \items -> do
         seed <- MWC.withSystemRandom $ MWC.asGenIO $
             V.replicateM 32 . MWC.uniform
         return (items :: Int, seed :: V.Vector Word32)
 
-    mbSummed <- mapReduce logger jobs $ \(items, seed) -> runST $ do
-        gen <- MWC.initialize seed
-        Just . Sum <$> makeFractal fp {fpNumPulses = items} gen
-
-    summed <- maybe
-        (fail "Internal error: No results from mapReduce") (return . unSum)
-        mbSummed
+    summed <- mapReduce logger jobs
+        (\(items, seed) -> runST $ do
+            gen <- MWC.initialize seed
+            makeFractal fp {fpNumPulses = items} gen)
+        (\x y -> M.computeProxy (Proxy :: Proxy M.P) $ M.zipWith (+) x y)
 
     return $ M.computeProxy (Proxy :: Proxy M.P) $
-        fmap scurve $ treshold r0 $
+        fmap scurve $ treshold fpTreshold $
         normalize $ M.delay summed
   where
-    r0       = 0.6
     scurve x = (1 + cos ((x - 1) * pi)) / 2
 
-main :: IO ()
-main = do
-    let workers      =  32
-        numkeyframes =   1
-        nonkeyframes =   0
+main2d :: IO ()
+main2d = do
+    let height   = 600
+        width    = 900
+        small    = M.Ix2 height width
+        world    = M.Sz (small .+. small .+. small)
+        v        = 3
+
+        fp = FractalParams
+            { fpWorld      = world
+            , fpCropOffset = small
+            , fpCropSize   = M.Sz small
+            , fpNumPulses  = M.totalElem world * v
+            , fpAlpha      = 5 / 3
+            , fpPulseShape = Annuli 1.2 8
+            , fpRhoIn      = 0.0
+            , fpRhoOut     = fromIntegral (max height width) * 1.5
+            , fpTreshold   = 0.6
+            }
+
+    -- Logging
+    lock <- MVar.newMVar ()
+    let logger = MVar.modifyMVar_ lock . const . IO.hPutStrLn IO.stderr
+
+    image <- makeClouds logger fp
+    either fail id $ JP.writeGifImageWithPalette "clouds2d.gif"
+        (JP.Image width height $ MV.toVector $
+            M.computeProxy (Proxy :: Proxy M.P) $
+            fmap floatToWord8 $ M.delay image)
+        palette
+
+main3d :: IO ()
+main3d = do
+    let numkeyframes =  32
+        nonkeyframes =   2
         delay        =   4
 
         height   =  900
@@ -338,16 +361,12 @@ main = do
             , fpPulseShape = Annuli 1.2 8
             , fpRhoIn      = 0.0
             , fpRhoOut     = fromIntegral (max height width) * 1.5
+            , fpTreshold   = 0.6
             }
 
     -- Logging
     lock <- MVar.newMVar ()
     let logger = MVar.modifyMVar_ lock . const . IO.hPutStrLn IO.stderr
-
-    -- Generate some reusable zeroes.
-    logger "Generating zeroes..."
-    let zeroes = M.replicate M.Seq (M.Sz small) 0 :: M.Array M.P M.Ix3 Float
-    let scurve x = (1 + cos ((x - 1) * pi)) / 2
 
     cuby <- makeClouds logger fp
 
@@ -382,3 +401,6 @@ main = do
                 }
         }
     -- JP.writePng "palette.png" palette
+
+main :: IO ()
+main = main2d -- >> main3d

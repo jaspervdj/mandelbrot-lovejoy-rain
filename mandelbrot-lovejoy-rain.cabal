@@ -18,7 +18,7 @@ Source-repository head
 Executable mlr-massiv
   Main-is:         Massiv.hs
   Hs-source-dirs:  src
-  Ghc-options:     -O2 -threaded -rtsopts -with-rtsopts=-N
+  Ghc-options:     -Wall -O2 -threaded -rtsopts -with-rtsopts=-N
   Default-language: Haskell2010
 
   Build-depends:
