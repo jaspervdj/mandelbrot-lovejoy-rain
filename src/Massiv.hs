@@ -9,6 +9,7 @@ module Main
     ) where
 
 import qualified Codec.Picture.Gif                 as JP
+import qualified Codec.Picture.Png                 as JP
 import qualified Codec.Picture.Types               as JP
 import           Control.Concurrent                (forkIO)
 import qualified Control.Concurrent.Chan           as Chan
@@ -29,6 +30,7 @@ import           Data.Maybe                        (catMaybes, fromMaybe,
                                                     isJust, listToMaybe)
 import           Data.Proxy                        (Proxy (..))
 import qualified Data.Vector                       as V
+import qualified Data.Vector.Storable              as VS
 import           Data.Word                         (Word32)
 import           Data.Word                         (Word8)
 import qualified System.IO                         as IO
@@ -216,24 +218,30 @@ treshold relativeTreshold arr =
 floatToWord8 :: Float -> Word8
 floatToWord8 = round . (* 255)
 
+pixelToWord8 :: JP.PixelRGBF -> JP.PixelRGB8
+pixelToWord8 (JP.PixelRGBF r g b) =
+    JP.PixelRGB8 (floatToWord8 r) (floatToWord8 g) (floatToWord8 b)
+
 palette :: JP.Palette
 palette = JP.generateImage
-    (\x _ -> bluewhite blue white $ fromIntegral x / 255.0)
+    (\x _ -> pixelToWord8 $ interpolate (fromIntegral x / 255.0) blue white)
     256
     1
-  where
 
-    blue  = JP.PixelRGBF 0.0 0.6 1.0
-    white = JP.PixelRGBF 1.0 1.0 1.0
+dark, blue, white :: JP.PixelRGBF
+dark  = JP.PixelRGBF 0.0 0.1 0.3
+blue  = JP.PixelRGBF 0.0 0.4 1.0
+white = JP.PixelRGBF 1.0 1.0 1.0
 
-    bluewhite :: JP.PixelRGBF -> JP.PixelRGBF -> Float -> JP.PixelRGB8
-    bluewhite (JP.PixelRGBF r0 g0 b0) (JP.PixelRGBF r1 g1 b1) t = JP.PixelRGB8
-        (floatToWord8 $ interpolate t r0 r1)
-        (floatToWord8 $ interpolate t g0 g1)
-        (floatToWord8 $ interpolate t b0 b1)
+class Interpolate a where
+    interpolate :: Float -> a -> a -> a
 
-interpolate :: Float -> Float -> Float -> Float
-interpolate t x y = (1.0 - t) * x + t * y
+instance Interpolate Float where
+    interpolate t x y = (1.0 - t) * x + t * y
+
+instance Interpolate JP.PixelRGBF where
+    interpolate t (JP.PixelRGBF r0 g0 b0) (JP.PixelRGBF r1 g1 b1) = JP.PixelRGBF
+        (interpolate t r0 r1) (interpolate t g0 g1) (interpolate t b0 b1)
 
 interpolateFrames
     :: M.Index ix
@@ -309,13 +317,30 @@ makeClouds logger fp@FractalParams {..} = do
   where
     scurve x = (1 + cos ((x - 1) * pi)) / 2
 
+makeGradientBackground
+    :: PrimMonad m
+    => MWC.Gen (PrimState m) -> Int -> Int -> m (JP.Image JP.PixelRGBF)
+makeGradientBackground gen width height = do
+    phi <- MWC.uniformR (0, 2 * pi) gen
+    let measure = fromIntegral $ max width height
+        rho     = 3 * measure
+        cx      = fromIntegral width  * 0.5 + rho * cos phi
+        cy      = fromIntegral height * 0.5 + rho * sin phi
+        render  = \x y ->
+            let dx   = fromIntegral x - cx
+                dy   = fromIntegral y - cy
+                dist = sqrt $ dx * dx + dy * dy
+                t    = (dist - (rho - measure)) / (2 * measure) in
+            interpolate t blue dark
+    pure $ JP.generateImage render width height
+
 main2d :: IO ()
 main2d = do
-    let height   = 600
-        width    = 900
+    let height   = 200
+        width    = 300
         small    = M.Ix2 height width
         world    = M.Sz (small .+. small .+. small)
-        v        = 3
+        v        = 1
 
         fp = FractalParams
             { fpWorld      = world
@@ -333,12 +358,33 @@ main2d = do
     lock <- MVar.newMVar ()
     let logger = MVar.modifyMVar_ lock . const . IO.hPutStrLn IO.stderr
 
+    gradientBackground <- MWC.withSystemRandom $ \gen ->
+        (makeGradientBackground gen width height :: IO (JP.Image JP.PixelRGBF))
+
+    JP.writePng "gradient.png" $ JP.pixelMap pixelToWord8 gradientBackground
+
+    -- Blend the background and the foreground.
+    clouds <- fmap
+        (MV.toVector .  M.computeProxy (Proxy :: Proxy M.P) . M.delay)
+        (makeClouds logger fp)
+    let image :: JP.Image JP.PixelRGBF
+        image = JP.generateImage
+            (\x y ->
+                let bg    = JP.pixelAt gradientBackground x y
+                    cloud = clouds V.! (x + y * width) in
+                interpolate cloud bg white)
+            width
+            height
+
+    JP.writePng "clouds.png" $ JP.pixelMap pixelToWord8 image
+    {-
     image <- makeClouds logger fp
     either fail id $ JP.writeGifImageWithPalette "clouds2d.gif"
         (JP.Image width height $ MV.toVector $
             M.computeProxy (Proxy :: Proxy M.P) $
             fmap floatToWord8 $ M.delay image)
         palette
+    -}
 
 main3d :: IO ()
 main3d = do
