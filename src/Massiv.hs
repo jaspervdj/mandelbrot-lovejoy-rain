@@ -7,7 +7,6 @@
 module Main
     ( main
     ) where
-
 import qualified Codec.Picture.Gif                 as JP
 import qualified Codec.Picture.Png                 as JP
 import qualified Codec.Picture.Types               as JP
@@ -26,12 +25,13 @@ import qualified Data.Massiv.Array                 as M
 import qualified Data.Massiv.Array.Manifest.Vector as MV
 import qualified Data.Massiv.Array.Mutable         as MM
 import qualified Data.Massiv.Array.Unsafe          as M
+import qualified Data.Massiv.Array.IO              as MIO
 import           Data.Maybe                        (catMaybes, fromMaybe,
                                                     isJust, listToMaybe)
 import           Data.Proxy                        (Proxy (..))
 import qualified Data.Vector                       as V
-import           Data.Word                         (Word32)
-import           Data.Word                         (Word8)
+import           Data.Word                         (Word32, Word8)
+import           Graphics.ColorSpace
 import qualified System.IO                         as IO
 import qualified System.Random.MWC                 as MWC
 
@@ -45,19 +45,12 @@ newtype Distance = Distance Float
 --------------------------------------------------------------------------------
 -- Utilities for dimension-generic algorithms.
 
-unit :: M.Index ix => ix
-unit = M.pureIndex 1
-
-(.-.), (.+.) :: M.Index ix => ix -> ix -> ix
-(.-.) = M.liftIndex2 (-)
-(.+.) = M.liftIndex2 (+)
-
 intersection :: M.Index ix => (ix, ix) -> (ix, ix) -> (ix, ix)
 intersection (l1, r1) (l2, r2) =
     (M.liftIndex2 max l1 l2, M.liftIndex2 min r1 r2)
 
-offset :: M.Index ix => ix -> HPulse ix -> HPulse ix
-offset o hp = hp {hpCenter = hpCenter hp .-. o}
+offset :: (Num ix, M.Index ix) => ix -> HPulse ix -> HPulse ix
+offset o hp = hp {hpCenter = hpCenter hp - o}
 
 distance :: M.Index ix => ix -> ix -> Distance
 distance i j =
@@ -77,14 +70,14 @@ data HPulse ix = HPulse
 arbitraryIndex
     :: forall m ix. (PrimMonad m, M.MonadThrow m, M.Index ix)
     => MWC.Gen (PrimState m) -> M.Sz ix -> m ix
-arbitraryIndex gen (M.Sz choice) =
+arbitraryIndex gen sz@(M.Sz choice) =
     foldM
         (\acc dim -> do
-            up <- M.getDimM choice (M.Dim dim)
+            up <- M.getDimM choice dim
             x  <- MWC.uniformR (0, up) gen
-            M.setDimM acc (M.Dim dim) x)
+            M.setDimM acc dim x)
         choice
-        [1 .. M.unDim (M.dimensions (Proxy :: Proxy ix))]
+        [1 .. M.dimensions sz]
 
 arbitraryPulse
     :: forall m ix. (PrimMonad m, M.MonadThrow m, M.Index ix)
@@ -116,24 +109,24 @@ pulseAt (Annuli lambda s) (Radius r) (Distance u) =
         sigma   = (lambda - lambda') / 2.0 in
     exp (-(((u*u) / (r*r) - (delta*delta)) / (sigma*sigma)) ** (2 * s))
 
-bounds :: M.Index ix => PulseShape -> HPulse ix -> (ix, ix)
+bounds :: (Num ix, M.Index ix) => PulseShape -> HPulse ix -> (ix, ix)
 bounds shape hp =
     let bound = fromMaybe 0.0 . listToMaybe .
             dropWhile ((>= 0.1e-6) . pulseAt shape (hpRadius hp) . Distance) .
             iterate succ . unRadius $ hpRadius hp
 
         radIdx = M.pureIndex $ ceiling bound
-        start  = hpCenter hp .-. radIdx
-        end    = hpCenter hp .+. radIdx .+. unit in
+        start  = hpCenter hp - radIdx
+        end    = hpCenter hp + radIdx + M.oneIndex in
     (start, end)
 
 addPulse
-    :: forall ix r m. (MM.Mutable r ix Float, M.PrimMonad m, M.MonadThrow m)
+    :: forall ix r m. (Num ix, MM.Mutable r ix Float, M.PrimMonad m, M.MonadThrow m)
     => MM.MArray (M.PrimState m) r ix Float
     -> PulseShape
     -> HPulse ix
     -> m ()
-addPulse marr shape pulse@HPulse {..} = M.iterM_ i0 end unit (<) $ \i ->
+addPulse marr shape pulse@HPulse {..} = M.iterM_ i0 end M.oneIndex (<) $ \i ->
     MM.modifyM
         marr
         (\x -> pure $ x + hpAmp * pulseAt shape hpRadius (distance i hpCenter))
@@ -161,7 +154,7 @@ data FractalParams ix = FractalParams
     }
 
 makeFractal
-    :: (M.Index ix, PrimMonad m, M.MonadThrow m)
+    :: (Num ix, M.Index ix, PrimMonad m, M.MonadThrow m)
     => FractalParams ix
     -> MWC.Gen (PrimState m)
     -> m (M.Array M.P ix Float)
@@ -295,7 +288,7 @@ divideWork total workers =
     zipWith (+) (replicate remainder 1 ++ repeat 0) (replicate workers items)
 
 makeClouds
-    :: M.Index ix
+    :: (Num ix, M.Index ix)
     => (String -> IO ())   -- ^ Logging
     -> FractalParams ix    -- ^ Parameters
     -> IO (M.Array M.P ix Float)
@@ -339,7 +332,7 @@ main2d = do
     let height   =  900
         width    = 1600
         small    = M.Ix2 height width
-        world    = M.Sz (small .+. small .+. small)
+        world    = M.Sz (3 * small)
         v        = 3
 
         fp = FractalParams
@@ -362,14 +355,12 @@ main2d = do
         (makeGradientBackground gen width height :: IO (JP.Image JP.PixelRGBF))
 
     -- Blend the background and the foreground.
-    clouds <- fmap
-        (MV.toVector .  M.computeProxy (Proxy :: Proxy M.P) . M.delay)
-        (makeClouds logger fp)
+    clouds <- M.flatten <$> makeClouds logger fp
     let image :: JP.Image JP.PixelRGBF
         image = JP.generateImage
             (\x y ->
                 let bg    = JP.pixelAt gradientBackground x y
-                    cloud = clouds V.! (x + y * width) in
+                    cloud = clouds M.! (x + y * width) in
                 interpolate cloud bg white)
             width
             height
@@ -385,7 +376,7 @@ main3d = do
         height   = 200
         width    = 300
         small    = M.Ix3 numkeyframes height width
-        world    = M.Sz (1 .+. small .+. small)
+        world    = M.Sz (1 + 2 * small)
         v        = 1
 
         fp = FractalParams
