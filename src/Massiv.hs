@@ -30,7 +30,6 @@ import           Data.Maybe                        (catMaybes, fromMaybe,
                                                     isJust, listToMaybe)
 import           Data.Proxy                        (Proxy (..))
 import qualified Data.Vector                       as V
-import qualified Data.Vector.Storable              as VS
 import           Data.Word                         (Word32)
 import           Data.Word                         (Word8)
 import qualified System.IO                         as IO
@@ -61,7 +60,8 @@ offset :: M.Index ix => ix -> HPulse ix -> HPulse ix
 offset o hp = hp {hpCenter = hpCenter hp .-. o}
 
 distance :: M.Index ix => ix -> ix -> Distance
-distance i j = Distance . sqrt . fromIntegral .  M.foldlIndex (+) 0 $
+distance i j =
+    Distance . sqrt . fromIntegral . M.foldlIndex (+) 0 $
     M.liftIndex2 (\p s -> (p - s) * (p - s)) i j
 
 
@@ -336,11 +336,11 @@ makeGradientBackground gen width height = do
 
 main2d :: IO ()
 main2d = do
-    let height   = 200
-        width    = 300
+    let height   =  900
+        width    = 1600
         small    = M.Ix2 height width
         world    = M.Sz (small .+. small .+. small)
-        v        = 1
+        v        = 3
 
         fp = FractalParams
             { fpWorld      = world
@@ -348,7 +348,7 @@ main2d = do
             , fpCropSize   = M.Sz small
             , fpNumPulses  = M.totalElem world * v
             , fpAlpha      = 5 / 3
-            , fpPulseShape = Annuli 1.2 8
+            , fpPulseShape = Rectangular -- Annuli 1.2 8
             , fpRhoIn      = 0.0
             , fpRhoOut     = fromIntegral (max height width) * 1.5
             , fpTreshold   = 0.6
@@ -360,8 +360,6 @@ main2d = do
 
     gradientBackground <- MWC.withSystemRandom $ \gen ->
         (makeGradientBackground gen width height :: IO (JP.Image JP.PixelRGBF))
-
-    JP.writePng "gradient.png" $ JP.pixelMap pixelToWord8 gradientBackground
 
     -- Blend the background and the foreground.
     clouds <- fmap
@@ -376,15 +374,7 @@ main2d = do
             width
             height
 
-    JP.writePng "clouds.png" $ JP.pixelMap pixelToWord8 image
-    {-
-    image <- makeClouds logger fp
-    either fail id $ JP.writeGifImageWithPalette "clouds2d.gif"
-        (JP.Image width height $ MV.toVector $
-            M.computeProxy (Proxy :: Proxy M.P) $
-            fmap floatToWord8 $ M.delay image)
-        palette
-    -}
+    JP.writePng "2d.png" $ JP.pixelMap pixelToWord8 image
 
 main3d :: IO ()
 main3d = do
@@ -392,8 +382,8 @@ main3d = do
         nonkeyframes =   2
         delay        =   4
 
-        height   =  900
-        width    = 1600
+        height   = 200
+        width    = 300
         small    = M.Ix3 numkeyframes height width
         world    = M.Sz (1 .+. small .+. small)
         v        = 1
@@ -428,7 +418,7 @@ main3d = do
             | frame <- interpolateFrames nonkeyframes (map M.delay keyframes)
             ]
 
-    either fail id $ JP.writeComplexGifImage "quick.gif" JP.GifEncode
+    either fail id $ JP.writeComplexGifImage "3d.gif" JP.GifEncode
         { JP.geWidth      = width
         , JP.geHeight     = height
         , JP.gePalette    = Just palette
@@ -446,7 +436,6 @@ main3d = do
                 , JP.gfPixels      = frame
                 }
         }
-    -- JP.writePng "palette.png" palette
 
 main :: IO ()
-main = main2d -- >> main3d
+main = main2d >> main3d
