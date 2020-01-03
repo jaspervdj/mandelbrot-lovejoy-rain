@@ -10,6 +10,7 @@ module Main
 import qualified Codec.Picture.Gif                 as JP
 import qualified Codec.Picture.Png                 as JP
 import qualified Codec.Picture.Types               as JP
+import           Control.Applicative
 import           Control.Concurrent                (forkIO)
 import qualified Control.Concurrent.Chan           as Chan
 import qualified Control.Concurrent.MVar           as MVar
@@ -21,7 +22,7 @@ import qualified Control.Scheduler                 as Scheduler
 import           Data.Bool                         (bool)
 import qualified Data.IORef                        as IORef
 import           Data.List                         (foldl')
-import qualified Data.Massiv.Array                 as M
+import           Data.Massiv.Array                 as M
 import qualified Data.Massiv.Array.Manifest.Vector as MV
 import qualified Data.Massiv.Array.Mutable         as MM
 import qualified Data.Massiv.Array.Unsafe          as M
@@ -142,15 +143,15 @@ addPulse marr shape pulse@HPulse {..} = M.iterM_ i0 end M.oneIndex (<) $ \i ->
 -- Generating the fractal.
 
 data FractalParams ix = FractalParams
-    { fpWorld      :: M.Sz ix
-    , fpCropOffset :: ix
-    , fpCropSize   :: M.Sz ix
-    , fpNumPulses  :: Int
-    , fpAlpha      :: Float
-    , fpPulseShape :: PulseShape
-    , fpRhoIn      :: Float
-    , fpRhoOut     :: Float
-    , fpTreshold   :: Float
+    { fpWorld      :: !(M.Sz ix)
+    , fpCropOffset :: !ix
+    , fpCropSize   :: !(M.Sz ix)
+    , fpNumPulses  :: !Int
+    , fpAlpha      :: !Float
+    , fpPulseShape :: !PulseShape
+    , fpRhoIn      :: !Float
+    , fpRhoOut     :: !Float
+    , fpThreshold  :: !Float
     }
 
 makeFractal
@@ -177,14 +178,14 @@ normalize arr =
     let (mini, maxi) = (M.minimum' arr, M.maximum' arr) in
     (\x -> (x - mini) / (maxi - mini)) <$> arr
 
-treshold
+threshold
     :: forall r ix. (Functor (M.Array r ix), M.Source r ix Float)
     => Float -> M.Array r ix Float -> M.Array r ix Float
-treshold relativeTreshold arr =
+threshold relativeThreshold arr =
     (\x ->
-        if x < absoluteTreshold
+        if x < absoluteThreshold
             then 0.0
-            else (x - absoluteTreshold) / (1.0 - absoluteTreshold)) <$> arr
+            else (x - absoluteThreshold) / (1.0 - absoluteThreshold)) <$> arr
   where
     numBuckets = 100
 
@@ -196,9 +197,9 @@ treshold relativeTreshold arr =
             MM.modifyM marr (pure . succ) b
         MM.freezeS marr
 
-    absoluteTreshold =
+    absoluteThreshold =
         let target = floor $
-                relativeTreshold * fromIntegral (M.totalElem (M.size arr))
+                relativeThreshold * fromIntegral (M.totalElem (M.size arr))
             go acc i
                 | i >= numBuckets = 1.0
                 | otherwise       =
@@ -208,23 +209,17 @@ treshold relativeTreshold arr =
                         else go acc' (i + 1)  in
         go 0 0
 
-floatToWord8 :: Float -> Word8
-floatToWord8 = round . (* 255)
-
-pixelToWord8 :: JP.PixelRGBF -> JP.PixelRGB8
-pixelToWord8 (JP.PixelRGBF r g b) =
-    JP.PixelRGB8 (floatToWord8 r) (floatToWord8 g) (floatToWord8 b)
-
 palette :: JP.Palette
-palette = JP.generateImage
-    (\x _ -> pixelToWord8 $ interpolate (fromIntegral x / 255.0) blue white)
-    256
-    1
+palette =
+    MIO.toJPImageRGB8 $
+    M.resize' (Sz2 1 256) $
+    M.makeArrayR D Seq (Sz1 256) $ \x ->
+      toWord8 $ interpolate (fromIntegral x / 255.0) blue white
 
-dark, blue, white :: JP.PixelRGBF
-dark  = JP.PixelRGBF 0.0 0.1 0.3
-blue  = JP.PixelRGBF 0.0 0.4 1.0
-white = JP.PixelRGBF 1.0 1.0 1.0
+dark, blue, white :: Pixel RGB Float
+dark  = PixelRGB 0.0 0.1 0.3
+blue  = PixelRGB 0.0 0.4 1.0
+white = PixelRGB 1.0 1.0 1.0
 
 class Interpolate a where
     interpolate :: Float -> a -> a -> a
@@ -232,25 +227,28 @@ class Interpolate a where
 instance Interpolate Float where
     interpolate t x y = (1.0 - t) * x + t * y
 
-instance Interpolate JP.PixelRGBF where
-    interpolate t (JP.PixelRGBF r0 g0 b0) (JP.PixelRGBF r1 g1 b1) = JP.PixelRGBF
-        (interpolate t r0 r1) (interpolate t g0 g1) (interpolate t b0 b1)
+instance Interpolate (Pixel RGB Float) where
+    interpolate t = liftA2 (interpolate t)
 
 interpolateFrames
-    :: M.Index ix
-    => Int  -- Number of interpolation frames to insert
-    -> [M.Array M.D ix Float]
-    -> [M.Array M.D ix Float]
-interpolateFrames _   []           = []
-interpolateFrames _   [x]          = [x]
-interpolateFrames num (x : y : ys) =
-    [x] ++
-    [ M.zipWith (interpolate (fromIntegral n * spacing)) x y
-    | n <- [1 .. num]
-    ] ++
-    interpolateFrames num (y : ys)
+    :: Int  -- Number of interpolation frames to insert
+    -> M.Array M.B M.Ix1 (M.Array M.M Ix2 Float)
+    -> M.Array M.B M.Ix1 (MIO.Image M.S Y Word8)
+interpolateFrames num arr =
+    maybe (M.compute (M.map toArrayY arr)) (M.compute . setComp Par) $ do
+      (_, arr') <- M.unconsM arr
+      (_, l) <- M.unsnocM arr
+      frames <- concatM 1 $ M.zipWith interpolateSingle arr arr'
+      pure $ M.snoc frames $ toArrayY l
   where
     spacing = 1.0 / fromIntegral (num + 1)
+    toArrayY :: Source r Ix2 Float => M.Array r Ix2 Float -> MIO.Image M.S Y Word8
+    toArrayY = M.compute . M.map (PixelY . eToWord8)
+    interpolateSingle ::
+      M.Array M.M Ix2 Float -> M.Array M.M Ix2 Float -> M.Array M.D Ix1 (MIO.Image M.S Y Word8)
+    interpolateSingle x y =
+      (\n -> toArrayY (M.zipWith (interpolate (fromIntegral n * spacing :: Float)) x y)) <$>
+      (1 ... num)
 
 
 --------------------------------------------------------------------------------
@@ -267,7 +265,7 @@ mapReduce logger as f g = do
     bDone <- IORef.newIORef (0 :: Int)
     _     <- forkIO $ do
         Scheduler.withScheduler_ Scheduler.Par $ \scheduler ->
-            forM_ as $ \a ->
+            Control.Monad.forM_ as $ \a ->
             Scheduler.scheduleWork_ scheduler $ do
             let !b = f a
             done <- IORef.atomicModifyIORef' bDone $ \n -> (succ n, succ n)
@@ -285,7 +283,7 @@ mapReduce logger as f g = do
 divideWork :: Int -> Int -> [Int]
 divideWork total workers =
     let (items, remainder) = total `divMod` workers in
-    zipWith (+) (replicate remainder 1 ++ repeat 0) (replicate workers items)
+    Prelude.zipWith (+) (Prelude.replicate remainder 1 ++ repeat 0) (Prelude.replicate workers items)
 
 makeClouds
     :: (Num ix, M.Index ix)
@@ -293,7 +291,7 @@ makeClouds
     -> FractalParams ix    -- ^ Parameters
     -> IO (M.Array M.P ix Float)
 makeClouds logger fp@FractalParams {..} = do
-    jobs <- forM (divideWork fpNumPulses 32) $ \items -> do
+    jobs <- Control.Monad.forM (divideWork fpNumPulses 32) $ \items -> do
         seed <- MWC.withSystemRandom $ MWC.asGenIO $
             V.replicateM 32 . MWC.uniform
         return (items :: Int, seed :: V.Vector Word32)
@@ -302,76 +300,68 @@ makeClouds logger fp@FractalParams {..} = do
         (\(items, seed) -> runST $ do
             gen <- MWC.initialize seed
             makeFractal fp {fpNumPulses = items} gen)
-        (\x y -> M.computeProxy (Proxy :: Proxy M.P) $ M.zipWith (+) x y)
+        (\x y -> M.computeAs M.P $ M.zipWith (+) x y)
 
-    return $ M.computeProxy (Proxy :: Proxy M.P) $
-        fmap scurve $ treshold fpTreshold $
+    return $ M.computeAs M.P $
+        fmap scurve $ threshold fpThreshold $
         normalize $ M.delay summed
   where
     scurve x = (1 + cos ((x - 1) * pi)) / 2
 
 makeGradientBackground
     :: PrimMonad m
-    => MWC.Gen (PrimState m) -> Int -> Int -> m (JP.Image JP.PixelRGBF)
-makeGradientBackground gen width height = do
+    => MWC.Gen (PrimState m) -> M.Sz2 -> m (MIO.Image M.D RGB Float)
+makeGradientBackground gen sz@(M.Sz2 height width) = do
     phi <- MWC.uniformR (0, 2 * pi) gen
     let measure = fromIntegral $ max width height
         rho     = 3 * measure
         cx      = fromIntegral width  * 0.5 + rho * cos phi
         cy      = fromIntegral height * 0.5 + rho * sin phi
-        render  = \x y ->
+    pure $ M.makeArray Par sz $ \ (y :. x) ->
             let dx   = fromIntegral x - cx
                 dy   = fromIntegral y - cy
                 dist = sqrt $ dx * dx + dy * dy
                 t    = (dist - (rho - measure)) / (2 * measure) in
             interpolate t blue dark
-    pure $ JP.generateImage render width height
+
 
 main2d :: IO ()
 main2d = do
     let height   =  900
         width    = 1600
-        small    = M.Ix2 height width
-        world    = M.Sz (3 * small)
+        small    = M.Sz2 height width
+        world    = 3 * small
         v        = 3
 
         fp = FractalParams
             { fpWorld      = world
-            , fpCropOffset = small
-            , fpCropSize   = M.Sz small
+            , fpCropOffset = M.unSz small
+            , fpCropSize   = small
             , fpNumPulses  = M.totalElem world * v
             , fpAlpha      = 5 / 3
             , fpPulseShape = Rectangular -- Annuli 1.2 8
             , fpRhoIn      = 0.0
             , fpRhoOut     = fromIntegral (max height width) * 1.5
-            , fpTreshold   = 0.6
+            , fpThreshold   = 0.6
             }
 
     -- Logging
     lock <- MVar.newMVar ()
     let logger = MVar.modifyMVar_ lock . const . IO.hPutStrLn IO.stderr
 
-    gradientBackground <- MWC.withSystemRandom $ \gen ->
-        (makeGradientBackground gen width height :: IO (JP.Image JP.PixelRGBF))
+    gradientBackground <- MWC.withSystemRandom . MWC.asGenST $ (`makeGradientBackground` small)
 
     -- Blend the background and the foreground.
-    clouds <- M.flatten <$> makeClouds logger fp
-    let image :: JP.Image JP.PixelRGBF
-        image = JP.generateImage
-            (\x y ->
-                let bg    = JP.pixelAt gradientBackground x y
-                    cloud = clouds M.! (x + y * width) in
-                interpolate cloud bg white)
-            width
-            height
-
-    JP.writePng "2d.png" $ JP.pixelMap pixelToWord8 image
+    clouds <- makeClouds logger fp
+    let image :: MIO.Image M.D RGB Float
+        image = M.zipWith (\cloud bg -> interpolate cloud bg white) clouds gradientBackground
+    MIO.writeImage "2d.png" $ M.map toWord8 image
 
 main3d :: IO ()
 main3d = do
     let numkeyframes =  32
         nonkeyframes =   2
-        delay        =   4
+        gifDelay     =   4
 
         height   = 200
         width    = 300
@@ -388,7 +378,7 @@ main3d = do
             , fpPulseShape = Annuli 1.2 8
             , fpRhoIn      = 0.0
             , fpRhoOut     = fromIntegral (max height width) * 1.5
-            , fpTreshold   = 0.6
+            , fpThreshold  = 0.6
             }
 
     -- Logging
@@ -398,16 +388,12 @@ main3d = do
     cuby <- makeClouds logger fp
 
     logger "Generating keyframes..."
-    let keyframes :: [M.Array M.M M.Ix2 Float]
-        keyframes = [cuby M.!> d | d <- [0 .. numkeyframes - 1]]
+    let keyframes :: M.Array M.D M.Ix1 (M.Array M.M M.Ix2 Float)
+        keyframes = M.map (cuby M.!>) (0 ..: numkeyframes)
 
         frames :: [JP.Image Word8]
-        frames =
-            [ JP.Image width height $ MV.toVector $
-                M.computeProxy (Proxy :: Proxy M.P) $
-                fmap floatToWord8 frame
-            | frame <- interpolateFrames nonkeyframes (map M.delay keyframes)
-            ]
+        frames = M.toList $ M.map MIO.toJPImageY8 $
+                 interpolateFrames nonkeyframes $ M.compute keyframes
 
     either fail id $ JP.writeComplexGifImage "3d.gif" JP.GifEncode
         { JP.geWidth      = width
@@ -422,7 +408,7 @@ main3d = do
                 , JP.gfYOffset     = 0
                 , JP.gfPalette     = Nothing
                 , JP.gfTransparent = Nothing
-                , JP.gfDelay       = delay
+                , JP.gfDelay       = gifDelay
                 , JP.gfDisposal    = JP.DisposalDoNot
                 , JP.gfPixels      = frame
                 }
