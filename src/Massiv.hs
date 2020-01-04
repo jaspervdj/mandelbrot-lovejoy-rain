@@ -1,9 +1,9 @@
-{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE BangPatterns        #-}
 {-# LANGUAGE FlexibleContexts    #-}
 {-# LANGUAGE FlexibleInstances   #-}
 {-# LANGUAGE RecordWildCards     #-}
 {-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE TypeApplications    #-}
 module Main
     ( main
     ) where
@@ -45,11 +45,11 @@ intersection (l1, r1) (l2, r2) =
 {-# INLINE intersection #-}
 
 offset :: (Num ix, M.Index ix) => ix -> HPulse ix -> HPulse ix
-offset !o !hp = hp {hpCenter = hpCenter hp - o}
+offset o hp = hp {hpCenter = hpCenter hp - o}
 {-# INLINE offset #-}
 
 distance :: M.Index ix => ix -> ix -> Distance
-distance !i !j =
+distance i j =
     Distance . sqrt . fromIntegral . M.foldlIndex (+) 0 $
     M.liftIndex2 (\p s -> (p - s) * (p - s)) i j
 {-# INLINE distance #-}
@@ -69,7 +69,7 @@ arbitraryIndex
     => MWC.Gen (PrimState m) -> M.Sz ix -> m ix
 arbitraryIndex gen sz@(M.Sz choice) =
     foldM
-        (\ !acc !dim -> do
+        (\ acc dim -> do
             up <- M.getDimM choice dim
             x  <- MWC.uniformR (0, up) gen
             M.setDimM acc dim x)
@@ -96,28 +96,28 @@ arbitraryPulse gen alpha area = do
 
 data PulseShape
     = Rectangular
-    | Smooth !Float    -- s
-    | Annuli !Float !Float  -- lambda, s
+    | Smooth Float    -- s
+    | Annuli Float Float  -- lambda, s
 
 pulseAt :: PulseShape -> Radius -> Distance -> Float
 pulseAt Rectangular       (Radius r) (Distance u) = if u <= r then 1.0 else 0.0
 pulseAt (Smooth s)        (Radius r) (Distance u) = exp (-(u / r) ** (2 * s))
 pulseAt (Annuli lambda s) (Radius r) (Distance u) =
-    let !lambda' = sqrt (lambda * lambda - 1.0)
-        !delta   = (lambda + lambda') / 2.0
-        !sigma   = (lambda - lambda') / 2.0 in
+    let lambda' = sqrt (lambda * lambda - 1.0)
+        delta   = (lambda + lambda') / 2.0
+        sigma   = (lambda - lambda') / 2.0 in
     exp (-(((u*u) / (r*r) - (delta*delta)) / (sigma*sigma)) ** (2 * s))
 {-# INLINE pulseAt #-}
 
 bounds :: (Num ix, M.Index ix) => PulseShape -> HPulse ix -> (ix, ix)
 bounds shape hp =
-    let !bound = fromMaybe 0.0 . listToMaybe .
+    let bound = fromMaybe 0.0 . listToMaybe .
             dropWhile ((>= 0.1e-6) . pulseAt shape (hpRadius hp) . Distance) .
             iterate succ . unRadius $ hpRadius hp
 
-        !radIdx = M.pureIndex $ ceiling bound
-        !start  = hpCenter hp - radIdx
-        !end    = hpCenter hp + radIdx + M.oneIndex in
+        radIdx = M.pureIndex $ ceiling bound
+        start  = hpCenter hp - radIdx
+        end    = hpCenter hp + radIdx + M.oneIndex in
     (start, end)
 {-# INLINE bounds #-}
 
@@ -133,9 +133,9 @@ addPulse marr shape pulse@HPulse {..} = M.iterM_ i0 end M.oneIndex (<) $ \i ->
         (\x -> pure $ x + hpAmp * pulseAt shape hpRadius (distance i hpCenter))
         i
   where
-    !pulseBounds = bounds shape pulse
-    !marrBounds  = (M.zeroIndex, M.unSz (M.msize marr))
-    (!i0, !end)  = intersection pulseBounds marrBounds
+    pulseBounds = bounds shape pulse
+    marrBounds  = (M.zeroIndex, M.unSz (M.msize marr))
+    (i0, end)   = intersection pulseBounds marrBounds
 {-# INLINE addPulse #-}
 
 
@@ -172,17 +172,17 @@ writeFractal FractalParams {..} gen marr =
 --------------------------------------------------------------------------------
 -- | Post-processing utilities.
 
-normalize
-    :: (Functor (M.Array r ix), M.Source r ix Float)
-    => M.Array r ix Float -> M.Array r ix Float
+normalize ::
+    M.Index ix =>
+    M.Array M.D ix Float -> M.Array M.D ix Float
 normalize arr =
     let (mini, maxi) = (M.minimum' arr, M.maximum' arr) in
     (\x -> (x - mini) / (maxi - mini)) <$> arr
 {-# INLINE normalize #-}
 
-threshold
-    :: forall r ix. (Functor (M.Array r ix), M.Source r ix Float)
-    => Float -> M.Array r ix Float -> M.Array r ix Float
+threshold ::
+    M.Index ix =>
+    Float -> M.Array M.D ix Float -> M.Array M.D ix Float
 threshold relativeThreshold arr =
     (\x ->
         if x < absoluteThreshold
@@ -192,19 +192,18 @@ threshold relativeThreshold arr =
     !numBuckets = 100
 
     histogram :: M.Array M.P Int Int
-    histogram = MM.createArrayST_ M.Seq (M.Sz numBuckets + 1) $ \ marr ->
+    !histogram = MM.createArrayST_ M.Seq (M.Sz numBuckets + 1) $ \ marr ->
         M.forM_ arr $ \x ->
             let b = floor (x * fromIntegral numBuckets) in
             MM.modifyM_ marr (pure . succ) b
-    {-# INLINE histogram #-}
 
     !absoluteThreshold =
         let target = floor $
                 relativeThreshold * fromIntegral (M.totalElem (M.size arr))
-            go acc i
+            go !acc i
                 | i >= numBuckets = 1.0
                 | otherwise       =
-                    let acc' = acc + fromMaybe 0 (M.index histogram i) in
+                    let !acc' = acc + fromMaybe 0 (M.index histogram i) in
                     if acc' >= target
                         then fromIntegral i / fromIntegral numBuckets
                         else go acc' (i + 1)  in
@@ -245,7 +244,7 @@ interpolateFrames num arr =
       frames <- concatM 1 $ M.zipWith interpolateSingle arr arr'
       pure $ M.snoc frames $ toArrayY l
   where
-    !spacing = 1.0 / fromIntegral (num + 1)
+    spacing = 1.0 / fromIntegral (num + 1)
     toArrayY :: Source r Ix2 Float => M.Array r Ix2 Float -> MIO.Image M.S Y Word8
     toArrayY = M.compute . M.map (PixelY . eToWord8)
     {-# INLINE toArrayY #-}
@@ -262,13 +261,13 @@ interpolateFrames num arr =
 -- | Parallellizing the drawing across cores
 
 divideWork :: Int -> Int -> [Int]
-divideWork !total !workers =
+divideWork total workers =
     let (items, remainder) = total `divMod` workers in
     Prelude.zipWith (+) (Prelude.replicate remainder 1 ++ repeat 0) (Prelude.replicate workers items)
 {-# INLINE divideWork #-}
 
 weights :: Int -> Int -> M.Array M.P Int Int
-weights !fpNumPulses !nWorkers = M.fromList Par $ divideWork fpNumPulses nWorkers
+weights fpNumPulses nWorkers = M.fromList Par $ divideWork fpNumPulses nWorkers
 {-# INLINE weights #-}
 
 
@@ -283,15 +282,15 @@ makeClouds logger fp@FractalParams {..} = do
         gen <- MWC.createSystemRandom
         marr <- MM.new fpCropSize
         pure (i, gen, marr)
-    let !jobs = weights fpNumPulses 32
-        !num = M.unSz (M.size jobs)
+    let jobs = weights fpNumPulses 32
+        num = M.unSz (M.size jobs)
     _ :: M.Array M.U M.Ix1 () <- M.forWS wss jobs $ \items (i, gen, marr) -> do
             writeFractal fp {fpNumPulses = items} gen marr
             done <- IORef.atomicModifyIORef' bDone $ \n -> (succ n, succ n)
             logger $ "Worker: " ++ show i ++ " finished job " ++ show done ++ "/" ++ show num
     fractals <-
         M.createArray_ @M.P M.Par fpCropSize $ \ scheduler marr ->
-            let collect !fractal =
+            let collect fractal =
                   iforSchedulerM_ scheduler fractal $ \ ix e ->
                   modifyM_ marr (pure . (+ e)) ix
                 {-# INLINE collect #-}
@@ -300,24 +299,24 @@ makeClouds logger fp@FractalParams {..} = do
     return $ M.computeAs M.P $
         fmap scurve $ threshold fpThreshold $ normalize $ M.delay fractals
   where
-    scurve !x = (1 + cos ((x - 1) * pi)) / 2
+    scurve x = (1 + cos ((x - 1) * pi)) / 2
     {-# INLINE scurve #-}
 {-# INLINE makeClouds #-}
 
 makeGradientBackground
     :: PrimMonad m
     => MWC.Gen (PrimState m) -> M.Sz2 -> m (MIO.Image M.D RGB Float)
-makeGradientBackground !gen sz@(M.Sz2 height width) = do
+makeGradientBackground gen sz@(M.Sz2 height width) = do
     phi <- MWC.uniformR (0, 2 * pi) gen
-    let !measure = fromIntegral $ max width height
-        !rho     = 3 * measure
-        !cx      = fromIntegral width  * 0.5 + rho * cos phi
-        !cy      = fromIntegral height * 0.5 + rho * sin phi
+    let measure = fromIntegral $ max width height
+        rho     = 3 * measure
+        cx      = fromIntegral width  * 0.5 + rho * cos phi
+        cy      = fromIntegral height * 0.5 + rho * sin phi
     pure $ M.makeArray Par sz $ \ (y :. x) ->
-            let !dx   = fromIntegral x - cx
-                !dy   = fromIntegral y - cy
-                !dist = sqrt $ dx * dx + dy * dy
-                !t    = (dist - (rho - measure)) / (2 * measure) in
+            let dx   = fromIntegral x - cx
+                dy   = fromIntegral y - cy
+                dist = sqrt $ dx * dx + dy * dy
+                t    = (dist - (rho - measure)) / (2 * measure) in
             interpolate t blue dark
 {-# INLINE makeGradientBackground #-}
 
