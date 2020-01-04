@@ -1,6 +1,7 @@
-{-# LANGUAGE BangPatterns        #-}
 {-# LANGUAGE FlexibleContexts    #-}
 {-# LANGUAGE FlexibleInstances   #-}
+{-# LANGUAGE NoImplicitPrelude   #-}
+{-# LANGUAGE OverloadedStrings   #-}
 {-# LANGUAGE RecordWildCards     #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications    #-}
@@ -9,24 +10,15 @@ module Main
     ) where
 import qualified Codec.Picture.Gif                 as JP
 import qualified Codec.Picture.Types               as JP
-import           Control.Applicative
-import qualified Control.Concurrent.MVar           as MVar
-import           Control.Monad                     (foldM, replicateM_, when)
-import           Control.Monad.Primitive           (PrimMonad (..))
 import qualified Control.Scheduler                 as Scheduler
 import qualified Control.Scheduler.Internal        as Scheduler
-import           Data.Bool                         (bool)
-import           Data.Foldable                     as F
-import qualified Data.IORef                        as IORef
 import           Data.Massiv.Array                 as M
 import qualified Data.Massiv.Array.Mutable         as MM
 import qualified Data.Massiv.Array.Unsafe          as M
 import qualified Data.Massiv.Array.IO              as MIO
-import           Data.Maybe                        (fromMaybe,
-                                                    listToMaybe)
-import           Data.Word                         (Word8)
 import           Graphics.ColorSpace
-import qualified System.IO                         as IO
+import           RIO
+import           RIO.List                          as L
 import qualified System.Random.MWC                 as MWC
 
 --------------------------------------------------------------------------------
@@ -61,27 +53,27 @@ data HPulse ix = HPulse
     }
 
 arbitraryIndex
-    :: forall m ix. (PrimMonad m, M.MonadThrow m, M.Index ix)
-    => MWC.Gen (PrimState m) -> M.Sz ix -> m ix
+    :: forall m ix. (MonadIO m, PrimMonad m, M.MonadThrow m, M.Index ix)
+    => MWC.Gen RealWorld -> M.Sz ix -> m ix
 arbitraryIndex gen sz@(M.Sz choice) =
     foldM
         (\ acc dim -> do
             up <- M.getDimM choice dim
-            x  <- MWC.uniformR (0, up) gen
+            x  <- liftIO $ MWC.uniformR (0, up) gen
             M.setDimM acc dim x)
         choice
         [1 .. M.dimensions sz]
 
 arbitraryPulse
-    :: forall m ix. (PrimMonad m, M.MonadThrow m, M.Index ix)
-    => MWC.Gen (PrimState m) -> Float -> M.Sz ix -> m (HPulse ix)
+    :: forall m ix. (PrimMonad m, M.MonadThrow m, M.Index ix, MonadIO m)
+    => MWC.Gen RealWorld -> Float -> M.Sz ix -> m (HPulse ix)
 arbitraryPulse gen alpha area = do
     center <- arbitraryIndex gen area
-    rhoInv <- MWC.uniformR (0.0, 1.0) gen
+    rhoInv <- liftIO $ MWC.uniformR (0.0, 1.0) gen
     let rho   =  if rhoInv == 0.0 then 1.0 else 1.0 / (1.0 - rhoInv)
         radius = rho / 2.0
         amp    = rho ** (1.0 / alpha)
-    ampSign <- bool (-1.0) 1.0 <$> MWC.uniform gen
+    ampSign <- bool (-1.0) 1.0 <$> liftIO (MWC.uniform gen)
     return $ HPulse center (ampSign * amp) (Radius radius)
 
 
@@ -106,7 +98,7 @@ bounds :: (Num ix, M.Index ix) => PulseShape -> HPulse ix -> (ix, ix)
 bounds shape hp =
     let bound = fromMaybe 0.0 . listToMaybe .
             dropWhile ((>= 0.1e-6) . pulseAt shape (hpRadius hp) . Distance) .
-            iterate succ . unRadius $ hpRadius hp
+            iterate (+ 1) . unRadius $ hpRadius hp
 
         radIdx = M.pureIndex $ ceiling bound
         start  = hpCenter hp - radIdx
@@ -143,21 +135,24 @@ data FractalParams ix = FractalParams
     , fpRhoIn      :: !Float
     , fpRhoOut     :: !Float
     , fpThreshold  :: !Float
+    , fpLogFunc    :: !LogFunc
     }
+
+instance HasLogFunc (FractalParams ix) where
+  logFuncL = lens fpLogFunc (\e f -> e { fpLogFunc = f })
 
 
 writeFractal ::
-       (Num ix, M.Index ix, PrimMonad m, M.MonadThrow m)
-    => FractalParams ix
-    -> MWC.Gen (PrimState m)
-    -> M.MArray (PrimState m) M.P ix Float
-    -> m ()
-writeFractal FractalParams {..} gen marr =
+       (Num ix, M.Index ix)
+    => MWC.Gen (PrimState IO)
+    -> M.MArray (PrimState IO) M.P ix Float
+    -> RIO (FractalParams ix) ()
+writeFractal gen marr = do
+    FractalParams {..} <-  ask
+    let relevant = (\r -> r >= fpRhoIn && r <= fpRhoOut) . unRadius . hpRadius
     replicateM_ fpNumPulses $ do
         pulse <- offset fpCropOffset <$> arbitraryPulse gen fpAlpha fpWorld
         when (relevant pulse) $ addPulse marr fpPulseShape pulse
-  where
-    relevant = (\r -> r >= fpRhoIn && r <= fpRhoOut) . unRadius . hpRadius
 
 --------------------------------------------------------------------------------
 -- | Post-processing utilities.
@@ -184,7 +179,7 @@ threshold relativeThreshold arr =
     histogram = MM.createArrayST_ M.Seq (M.Sz numBuckets + 1) $ \ marr ->
         M.forM_ arr $ \x ->
             let b = floor (x * fromIntegral numBuckets) in
-            MM.modifyM_ marr (pure . succ) b
+            MM.modifyM_ marr (pure . (+ 1)) b
 
     absoluteThreshold =
         let target = floor $
@@ -246,43 +241,42 @@ interpolateFrames num arr =
 divideWork :: Int -> Int -> [Int]
 divideWork total workers =
     let (items, remainder) = total `divMod` workers in
-    Prelude.zipWith (+) (Prelude.replicate remainder 1 ++ repeat 0) (Prelude.replicate workers items)
+    L.zipWith (+) (RIO.replicate remainder 1 ++ repeat 0) (RIO.replicate workers items)
 
 weights :: Int -> Int -> M.Array M.P Int Int
 weights fpNumPulses nWorkers = M.fromList Par $ divideWork fpNumPulses nWorkers
 
 
-makeClouds
-    :: (Num ix, M.Index ix)
-    => (String -> IO ())   -- ^ Logging
-    -> FractalParams ix    -- ^ Parameters
-    -> IO (M.Array M.P ix Float)
-makeClouds logger fp@FractalParams {..} = do
-    bDone <- IORef.newIORef (0 :: Int)
+makeClouds ::
+     (Num ix, M.Index ix) => RIO (FractalParams ix) (M.Array M.P ix Float)
+makeClouds = do
+    fp@FractalParams {..} <- ask
+    bDone <- newIORef (0 :: Int)
     wss <- initWorkerStates Par $ \(Scheduler.WorkerId i) -> do
-        gen <- MWC.createSystemRandom
+        gen <- liftIO MWC.createSystemRandom
         marr <- MM.new fpCropSize
         pure (i, gen, marr)
     let jobs = weights fpNumPulses 32
         num = M.unSz (M.size jobs)
     _ :: M.Array M.U M.Ix1 () <- M.forWS wss jobs $ \items (i, gen, marr) -> do
-            writeFractal fp {fpNumPulses = items} gen marr
-            done <- IORef.atomicModifyIORef' bDone $ \n -> (succ n, succ n)
-            logger $ "Worker: " ++ show i ++ " finished job " ++ show done ++ "/" ++ show num
+            runRIO (fp {fpNumPulses = items}) $ writeFractal gen marr
+            done <- atomicModifyIORef' bDone $ \n -> let n' = n + 1 in (n', n')
+            logInfo $ "Worker: " <> display i <> " finished job " <>
+                      display done <> "/" <> display num
     fractals <-
         M.createArray_ @M.P M.Par fpCropSize $ \ scheduler marr ->
             let collect fractal =
                   iforSchedulerM_ scheduler fractal $ \ ix e ->
                   modifyM_ marr (pure . (+ e)) ix
-            in Prelude.mapM (\(_, _, m) -> M.unsafeFreeze Par m >>= collect) $
-               F.toList $ Scheduler._workerStatesArray wss
+            in RIO.mapM (\(_, _, m) -> M.unsafeFreeze Par m >>= collect) $
+               RIO.toList $ Scheduler._workerStatesArray wss
     return $ M.computeAs M.P $
         fmap scurve $ threshold fpThreshold $ normalize $ M.delay fractals
   where
     scurve x = (1 + cos ((x - 1) * pi)) / 2
 
 makeGradientBackground
-    :: PrimMonad m
+    :: (PrimMonad m)
     => MWC.Gen (PrimState m) -> M.Sz2 -> m (MIO.Image M.D RGB Float)
 makeGradientBackground gen sz@(M.Sz2 height width) = do
     phi <- MWC.uniformR (0, 2 * pi) gen
@@ -298,8 +292,8 @@ makeGradientBackground gen sz@(M.Sz2 height width) = do
             interpolate t blue dark
 
 
-main2d :: IO ()
-main2d = do
+main2d :: LogFunc -> IO ()
+main2d lf = do
     let height   =  900
         width    = 1600
         small    = M.Sz2 height width
@@ -315,23 +309,20 @@ main2d = do
             , fpPulseShape = Rectangular -- Annuli 1.2 8
             , fpRhoIn      = 0.0
             , fpRhoOut     = fromIntegral (max height width) * 1.5
-            , fpThreshold   = 0.6
+            , fpThreshold  = 0.6
+            , fpLogFunc    = lf
             }
-
-    -- Logging
-    lock <- MVar.newMVar ()
-    let logger = MVar.modifyMVar_ lock . const . IO.hPutStrLn IO.stderr
 
     gradientBackground <- MWC.withSystemRandom . MWC.asGenST $ (`makeGradientBackground` small)
 
     -- Blend the background and the foreground.
-    clouds <- makeClouds logger fp
+    clouds <- runRIO fp makeClouds
     let image :: MIO.Image M.D RGB Float
         image = M.zipWith (\cloud bg -> interpolate cloud bg white) clouds gradientBackground
     MIO.writeImage "2d.png" $ M.map toWord8 image
 
-main3d :: IO ()
-main3d = do
+main3d :: LogFunc -> IO ()
+main3d lf = do
     let numkeyframes =  32
         nonkeyframes =   2
         gifDelay     =   4
@@ -352,15 +343,12 @@ main3d = do
             , fpRhoIn      = 0.0
             , fpRhoOut     = fromIntegral (max height width) * 1.5
             , fpThreshold  = 0.6
+            , fpLogFunc    = lf
             }
 
-    -- Logging
-    lock <- MVar.newMVar ()
-    let logger = MVar.modifyMVar_ lock . const . IO.hPutStrLn IO.stderr
+    cuby <- runRIO fp makeClouds
 
-    cuby <- makeClouds logger fp
-
-    logger "Generating keyframes..."
+    runRIO fp $ logInfo "Generating keyframes..."
     let keyframes :: M.Array M.D M.Ix1 (M.Array M.M M.Ix2 Float)
         keyframes = M.map (cuby M.!>) (0 ..: numkeyframes)
 
@@ -388,7 +376,10 @@ main3d = do
         }
 
 main :: IO ()
-main = main2d >> main3d
+main = do
+  lo <- logOptionsHandle stdout False
+  withLogFunc lo $ \ lf ->
+    main2d lf >> main3d lf
 
 
 -- TODO:
