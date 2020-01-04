@@ -4,6 +4,7 @@
 {-# LANGUAGE FlexibleInstances   #-}
 {-# LANGUAGE RecordWildCards     #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TypeApplications #-}
 module Main
     ( main
     ) where
@@ -18,7 +19,9 @@ import           Control.Monad                     (foldM, forM, forM_,
 import           Control.Monad.Primitive           (PrimMonad (..))
 import           Control.Monad.ST                  (runST)
 import qualified Control.Scheduler                 as Scheduler
+import qualified Control.Scheduler.Internal        as Scheduler
 import           Data.Bool                         (bool)
+import           Data.Foldable                     as F
 import qualified Data.IORef                        as IORef
 import           Data.List                         (foldl')
 import           Data.Massiv.Array                 as M
@@ -152,18 +155,18 @@ data FractalParams ix = FractalParams
     }
 
 
--- writeFractal ::
---        (Num ix, M.Index ix, PrimMonad m, M.MonadThrow m)
---     => FractalParams ix
---     -> MWC.Gen (PrimState m)
---     -> M.MArray (PrimState m) M.P ix Float
---     -> m ()
--- writeFractal FractalParams {..} gen marr = do
---     replicateM_ fpNumPulses $ do
---         pulse <- offset fpCropOffset <$> arbitraryPulse gen fpAlpha fpWorld
---         when (relevant pulse) $ addPulse marr fpPulseShape pulse
---   where
---     relevant = (\r -> r >= fpRhoIn && r <= fpRhoOut) . unRadius . hpRadius
+writeFractal ::
+       (Num ix, M.Index ix, PrimMonad m, M.MonadThrow m)
+    => FractalParams ix
+    -> MWC.Gen (PrimState m)
+    -> M.MArray (PrimState m) M.P ix Float
+    -> m ()
+writeFractal FractalParams {..} gen marr = do
+    replicateM_ fpNumPulses $ do
+        pulse <- offset fpCropOffset <$> arbitraryPulse gen fpAlpha fpWorld
+        when (relevant pulse) $ addPulse marr fpPulseShape pulse
+  where
+    relevant = (\r -> r >= fpRhoIn && r <= fpRhoOut) . unRadius . hpRadius
 
 makeFractal
     :: (Num ix, M.Index ix, PrimMonad m, M.MonadThrow m)
@@ -272,38 +275,10 @@ weights :: Int -> Int -> M.Array M.P Int Int
 weights fpNumPulses nWorkers = M.fromList Par $ divideWork fpNumPulses nWorkers
 
 
--- extractWorkerStates = _workerStatesArray
-
--- makeClouds
---     :: (Num ix, M.Index ix)
---     => (String -> IO ())   -- ^ Logging
---     -> FractalParams ix    -- ^ Parameters
---     -> IO (M.Array M.P ix Float)
--- makeClouds logger fp@FractalParams {..} = do
---     wss <- initWorkerStates Par $ \(ThreadId i) -> do
---         gen <- MWC.createSystemRandom
---         marr <- MM.new fpCropSize
---         pure (i, gen, marr)
---     void $ M.forWS wss (weights fpNumPulses 32) $ \items (_, gen, marr) ->
---         writeFractal fp {fpNumPulses = items} gen marr
---     withSchedulerWS wss $ \scheduler -> unwrapSchedulerWS scheduler
---     jobs <- Control.Monad.forM (divideWork fpNumPulses 32) $ \items -> do
---         seed <- MWC.withSystemRandom $ MWC.asGenIO $
---             V.replicateM 32 . MWC.uniform
---         return (items :: Int, seed :: V.Vector Word32)
-
---     summed <- mapReduce logger jobs
---         (\(items, seed) -> runST $ do
---             gen <- MWC.initialize seed
---             makeFractal fp {fpNumPulses = items} gen)
---         (\x y -> M.computeAs M.P $ M.zipWith (+) x y)
-
---     return $ M.computeAs M.P $
---         fmap scurve $ threshold fpThreshold $
---         normalize $ M.delay summed
---   where
---     scurve x = (1 + cos ((x - 1) * pi)) / 2
-
+-- TODO:
+--  * Add `forWS_`, `iforWS_`, 'imapWS_` and `mapWS_`
+--  * Add public function for extracting the states (i.e. F.toList . Scheduler._workerStatesArray),
+--    while checking for IORef
 
 makeClouds
     :: (Num ix, M.Index ix)
@@ -312,20 +287,28 @@ makeClouds
     -> IO (M.Array M.P ix Float)
 makeClouds logger fp@FractalParams {..} = do
     bDone <- IORef.newIORef (0 :: Int)
-    gens <- initWorkerStates Par (const MWC.createSystemRandom)
+    wss <- initWorkerStates Par $ \(Scheduler.WorkerId i) -> do
+        gen <- MWC.createSystemRandom
+        marr <- MM.new fpCropSize
+        pure (i, gen, marr)
     let jobs = weights fpNumPulses 32
         num = M.unSz (M.size jobs)
-    parClouds :: M.Array M.B Ix1 (M.Array M.P ix Float) <-
-        M.forWS gens jobs $ \items gen -> do
-            arr <- makeFractal fp {fpNumPulses = items} gen
+    _ :: M.Array M.U M.Ix1 () <- M.forWS wss jobs $ \items (i, gen, marr) -> do
+            writeFractal fp {fpNumPulses = items} gen marr
             done <- IORef.atomicModifyIORef' bDone $ \n -> (succ n, succ n)
-            logger $ "Finished job " ++ show done ++ "/" ++ show num
-            pure arr
+            logger $ "Worker: " ++ show i ++ " finished job " ++ show done ++ "/" ++ show num
+    fractals <-
+        M.createArray_ @M.P M.Par fpCropSize $ \ scheduler marr ->
+            let collect fractal =
+                  iforSchedulerM_ scheduler fractal $ \ ix e ->
+                  modifyM_ marr (pure . (+ e)) ix
+            in Prelude.mapM (\(_, _, m) -> M.unsafeFreeze Par m >>= collect) $
+               F.toList $ Scheduler._workerStatesArray wss
     return $ M.computeAs M.P $
-        fmap scurve $ threshold fpThreshold $
-        normalize $ M.delay $ foldl1 (\x -> compute . M.zipWith (+) x) parClouds
+        fmap scurve $ threshold fpThreshold $ normalize $ M.delay fractals
   where
     scurve x = (1 + cos ((x - 1) * pi)) / 2
+
 
 makeGradientBackground
     :: PrimMonad m
