@@ -222,15 +222,17 @@ interpolateFrames num arr =
     maybe (M.compute (M.map toArrayY arr)) (M.compute . setComp Par) $ do
       (_, arr') <- M.unconsM arr
       (_, l) <- M.unsnocM arr
-      frames <- concatM 1 $ M.zipWith interpolateSingle arr arr'
+      let frames = mconcat $ M.toList $ M.zipWith interpolateSingle arr arr'
       pure $ M.snoc frames $ toArrayY l
   where
     spacing = 1.0 / fromIntegral (num + 1)
     toArrayY :: Source r Ix2 Float => M.Array r Ix2 Float -> MIO.Image M.S Y Word8
     toArrayY = M.compute . M.map (PixelY . eToWord8)
     interpolateSingle ::
-      M.Array M.M Ix2 Float -> M.Array M.M Ix2 Float -> M.Array M.D Ix1 (MIO.Image M.S Y Word8)
+      M.Array M.M Ix2 Float -> M.Array M.M Ix2 Float -> M.Array M.DL Ix1 (MIO.Image M.S Y Word8)
     interpolateSingle x y =
+      M.cons (toArrayY x) $
+      M.toLoadArray $
       (\n -> toArrayY (M.zipWith (interpolate (fromIntegral n * spacing :: Float)) x y)) <$>
       (1 ... num)
 
@@ -374,6 +376,7 @@ main3d lf = do
                 , JP.gfPixels      = frame
                 }
         }
+    runRIO fp $ logInfo $ "Generated " <> display (L.length frames) <> " frames"
 
 main :: IO ()
 main = do
@@ -386,3 +389,4 @@ main = do
 --  * Add `forWS_`, `iforWS_`, 'imapWS_` and `mapWS_`
 --  * Add public function for extracting the states (i.e. F.toList . Scheduler._workerStatesArray),
 --    while checking for IORef
+--  * Generalize `ConcatOuterM` to `Foldable`
