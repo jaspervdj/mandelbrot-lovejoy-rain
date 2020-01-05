@@ -5,19 +5,19 @@
 
 packages:
 - completed:
-    hackage: massiv-0.4.1.0@sha256:11aee35ddf64adcbfaceefab7d34feaa10d4fa282247018132ee7417b2395b74,4401
+    hackage: massiv-0.4.4.0@sha256:8db99aa31d9e8c91308df6f49e7ddeb0613a1b58bf0d548f767bc806d15ead46,4611
     pantry-tree:
-      size: 3782
-      sha256: 4bebbe23112dad70c14d812235d77c43016a14c1814cbdeb6530b2b5b5e6e63d
+      size: 3783
+      sha256: 97ef52bb808bcd5792efa6ff26fdb2ecff97b37be97f8a9c771a9dcb277da5d3
   original:
-    hackage: massiv-0.4.1.0
+    hackage: massiv-0.4.4.0
 - completed:
-    hackage: massiv-io-0.1.6.0@sha256:de470775334e1ad1d233cf02ad06ad7155f5c34e22a2e1cc99ce5ac19767e6a2,2305
+    hackage: massiv-io-0.1.9.0@sha256:7d15c0a4d4145e123303048d058da2a80c3761a0eca7b17bac754ed6a4aaa87d,2345
     pantry-tree:
-      size: 1378
-      sha256: 393ebbd16831473405c85b39de70414b765f56a970bf885d01c357d207df763d
+      size: 1431
+      sha256: 7c709e618e4c686846f55812e3f1790f490616fb25f4e395a55aa1f1884ef1d4
   original:
-    hackage: massiv-io-0.1.6.0
+    hackage: massiv-io-0.1.9.0
 - completed:
     hackage: scheduler-1.4.2@sha256:bad577cefa39840f2f09c43b900868ad7d2d5d50e24d014e1d5087044a4394c3,2888
     pantry-tree:

@@ -1,38 +1,24 @@
-{-# LANGUAGE BangPatterns        #-}
-{-# LANGUAGE DeriveFunctor       #-}
 {-# LANGUAGE FlexibleContexts    #-}
 {-# LANGUAGE FlexibleInstances   #-}
+{-# LANGUAGE NoImplicitPrelude   #-}
+{-# LANGUAGE OverloadedStrings   #-}
 {-# LANGUAGE RecordWildCards     #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TypeApplications    #-}
 module Main
     ( main
     ) where
-
 import qualified Codec.Picture.Gif                 as JP
-import qualified Codec.Picture.Png                 as JP
 import qualified Codec.Picture.Types               as JP
-import           Control.Concurrent                (forkIO)
-import qualified Control.Concurrent.Chan           as Chan
-import qualified Control.Concurrent.MVar           as MVar
-import           Control.Monad                     (foldM, forM, forM_,
-                                                    replicateM_, when)
-import           Control.Monad.Primitive           (PrimMonad (..))
-import           Control.Monad.ST                  (runST)
 import qualified Control.Scheduler                 as Scheduler
-import           Data.Bool                         (bool)
-import qualified Data.IORef                        as IORef
-import           Data.List                         (foldl')
-import qualified Data.Massiv.Array                 as M
-import qualified Data.Massiv.Array.Manifest.Vector as MV
+import qualified Control.Scheduler.Internal        as Scheduler
+import           Data.Massiv.Array                 as M
 import qualified Data.Massiv.Array.Mutable         as MM
 import qualified Data.Massiv.Array.Unsafe          as M
-import           Data.Maybe                        (catMaybes, fromMaybe,
-                                                    isJust, listToMaybe)
-import           Data.Proxy                        (Proxy (..))
-import qualified Data.Vector                       as V
-import           Data.Word                         (Word32)
-import           Data.Word                         (Word8)
-import qualified System.IO                         as IO
+import qualified Data.Massiv.Array.IO              as MIO
+import           Graphics.ColorSpace
+import           RIO
+import           RIO.List                          as L
 import qualified System.Random.MWC                 as MWC
 
 --------------------------------------------------------------------------------
@@ -45,25 +31,17 @@ newtype Distance = Distance Float
 --------------------------------------------------------------------------------
 -- Utilities for dimension-generic algorithms.
 
-unit :: M.Index ix => ix
-unit = M.pureIndex 1
-
-(.-.), (.+.) :: M.Index ix => ix -> ix -> ix
-(.-.) = M.liftIndex2 (-)
-(.+.) = M.liftIndex2 (+)
-
 intersection :: M.Index ix => (ix, ix) -> (ix, ix) -> (ix, ix)
 intersection (l1, r1) (l2, r2) =
     (M.liftIndex2 max l1 l2, M.liftIndex2 min r1 r2)
 
-offset :: M.Index ix => ix -> HPulse ix -> HPulse ix
-offset o hp = hp {hpCenter = hpCenter hp .-. o}
+offset :: (Num ix, M.Index ix) => ix -> HPulse ix -> HPulse ix
+offset o hp = hp {hpCenter = hpCenter hp - o}
 
 distance :: M.Index ix => ix -> ix -> Distance
 distance i j =
     Distance . sqrt . fromIntegral . M.foldlIndex (+) 0 $
     M.liftIndex2 (\p s -> (p - s) * (p - s)) i j
-
 
 --------------------------------------------------------------------------------
 -- Generating pulses
@@ -75,27 +53,27 @@ data HPulse ix = HPulse
     }
 
 arbitraryIndex
-    :: forall m ix. (PrimMonad m, M.MonadThrow m, M.Index ix)
-    => MWC.Gen (PrimState m) -> M.Sz ix -> m ix
-arbitraryIndex gen (M.Sz choice) =
+    :: forall m ix. (MonadIO m, PrimMonad m, M.MonadThrow m, M.Index ix)
+    => MWC.Gen RealWorld -> M.Sz ix -> m ix
+arbitraryIndex gen sz@(M.Sz choice) =
     foldM
-        (\acc dim -> do
-            up <- M.getDimM choice (M.Dim dim)
-            x  <- MWC.uniformR (0, up) gen
-            M.setDimM acc (M.Dim dim) x)
+        (\ acc dim -> do
+            up <- M.getDimM choice dim
+            x  <- liftIO $ MWC.uniformR (0, up) gen
+            M.setDimM acc dim x)
         choice
-        [1 .. M.unDim (M.dimensions (Proxy :: Proxy ix))]
+        [1 .. M.dimensions sz]
 
 arbitraryPulse
-    :: forall m ix. (PrimMonad m, M.MonadThrow m, M.Index ix)
-    => MWC.Gen (PrimState m) -> Float -> M.Sz ix -> m (HPulse ix)
+    :: forall m ix. (PrimMonad m, M.MonadThrow m, M.Index ix, MonadIO m)
+    => MWC.Gen RealWorld -> Float -> M.Sz ix -> m (HPulse ix)
 arbitraryPulse gen alpha area = do
     center <- arbitraryIndex gen area
-    rhoInv <- MWC.uniformR (0.0, 1.0) gen
+    rhoInv <- liftIO $ MWC.uniformR (0.0, 1.0) gen
     let rho   =  if rhoInv == 0.0 then 1.0 else 1.0 / (1.0 - rhoInv)
         radius = rho / 2.0
         amp    = rho ** (1.0 / alpha)
-    ampSign <- bool (-1.0) 1.0 <$> MWC.uniform gen
+    ampSign <- bool (-1.0) 1.0 <$> liftIO (MWC.uniform gen)
     return $ HPulse center (ampSign * amp) (Radius radius)
 
 
@@ -116,96 +94,96 @@ pulseAt (Annuli lambda s) (Radius r) (Distance u) =
         sigma   = (lambda - lambda') / 2.0 in
     exp (-(((u*u) / (r*r) - (delta*delta)) / (sigma*sigma)) ** (2 * s))
 
-bounds :: M.Index ix => PulseShape -> HPulse ix -> (ix, ix)
+bounds :: (Num ix, M.Index ix) => PulseShape -> HPulse ix -> (ix, ix)
 bounds shape hp =
     let bound = fromMaybe 0.0 . listToMaybe .
             dropWhile ((>= 0.1e-6) . pulseAt shape (hpRadius hp) . Distance) .
-            iterate succ . unRadius $ hpRadius hp
+            iterate (+ 1) . unRadius $ hpRadius hp
 
         radIdx = M.pureIndex $ ceiling bound
-        start  = hpCenter hp .-. radIdx
-        end    = hpCenter hp .+. radIdx .+. unit in
+        start  = hpCenter hp - radIdx
+        end    = hpCenter hp + radIdx + M.oneIndex in
     (start, end)
 
 addPulse
-    :: forall ix r m. (MM.Mutable r ix Float, M.PrimMonad m, M.MonadThrow m)
+    :: forall ix r m. (Num ix, MM.Mutable r ix Float, M.PrimMonad m, M.MonadThrow m)
     => MM.MArray (M.PrimState m) r ix Float
     -> PulseShape
     -> HPulse ix
     -> m ()
-addPulse marr shape pulse@HPulse {..} = M.iterM_ i0 end unit (<) $ \i ->
-    MM.modifyM
+addPulse marr shape pulse@HPulse {..} = M.iterM_ i0 end M.oneIndex (<) $ \i ->
+    MM.modifyM_
         marr
         (\x -> pure $ x + hpAmp * pulseAt shape hpRadius (distance i hpCenter))
         i
   where
     pulseBounds = bounds shape pulse
-    marrBounds  = (M.pureIndex 0, M.unSz (M.msize marr))
+    marrBounds  = (M.zeroIndex, M.unSz (M.msize marr))
     (i0, end)   = intersection pulseBounds marrBounds
-{-# INLINE addPulse #-}
 
 
 --------------------------------------------------------------------------------
 -- Generating the fractal.
 
 data FractalParams ix = FractalParams
-    { fpWorld      :: M.Sz ix
-    , fpCropOffset :: ix
-    , fpCropSize   :: M.Sz ix
-    , fpNumPulses  :: Int
-    , fpAlpha      :: Float
-    , fpPulseShape :: PulseShape
-    , fpRhoIn      :: Float
-    , fpRhoOut     :: Float
-    , fpTreshold   :: Float
+    { fpWorld      :: !(M.Sz ix)
+    , fpCropOffset :: !ix
+    , fpCropSize   :: !(M.Sz ix)
+    , fpNumPulses  :: !Int
+    , fpAlpha      :: !Float
+    , fpPulseShape :: !PulseShape
+    , fpRhoIn      :: !Float
+    , fpRhoOut     :: !Float
+    , fpThreshold  :: !Float
+    , fpLogFunc    :: !LogFunc
     }
 
-makeFractal
-    :: (M.Index ix, PrimMonad m, M.MonadThrow m)
-    => FractalParams ix
-    -> MWC.Gen (PrimState m)
-    -> m (M.Array M.P ix Float)
-makeFractal FractalParams {..} gen = do
-    marr <- MM.new fpCropSize
+instance HasLogFunc (FractalParams ix) where
+  logFuncL = lens fpLogFunc (\e f -> e { fpLogFunc = f })
+
+
+writeFractal ::
+       (Num ix, M.Index ix)
+    => MWC.Gen (PrimState IO)
+    -> M.MArray (PrimState IO) M.P ix Float
+    -> RIO (FractalParams ix) ()
+writeFractal gen marr = do
+    FractalParams {..} <-  ask
+    let relevant = (\r -> r >= fpRhoIn && r <= fpRhoOut) . unRadius . hpRadius
     replicateM_ fpNumPulses $ do
         pulse <- offset fpCropOffset <$> arbitraryPulse gen fpAlpha fpWorld
         when (relevant pulse) $ addPulse marr fpPulseShape pulse
-    M.unsafeFreeze M.Seq marr
-  where
-    relevant = (\r -> r >= fpRhoIn && r <= fpRhoOut) . unRadius . hpRadius
 
 --------------------------------------------------------------------------------
 -- | Post-processing utilities.
 
-normalize
-    :: (Functor (M.Array r ix), M.Source r ix Float)
-    => M.Array r ix Float -> M.Array r ix Float
+normalize ::
+    M.Index ix =>
+    M.Array M.D ix Float -> M.Array M.D ix Float
 normalize arr =
     let (mini, maxi) = (M.minimum' arr, M.maximum' arr) in
     (\x -> (x - mini) / (maxi - mini)) <$> arr
 
-treshold
-    :: forall r ix. (Functor (M.Array r ix), M.Source r ix Float)
-    => Float -> M.Array r ix Float -> M.Array r ix Float
-treshold relativeTreshold arr =
+threshold ::
+    M.Index ix =>
+    Float -> M.Array M.D ix Float -> M.Array M.D ix Float
+threshold relativeThreshold arr =
     (\x ->
-        if x < absoluteTreshold
+        if x < absoluteThreshold
             then 0.0
-            else (x - absoluteTreshold) / (1.0 - absoluteTreshold)) <$> arr
+            else (x - absoluteThreshold) / (1.0 - absoluteThreshold)) <$> arr
   where
     numBuckets = 100
 
     histogram :: M.Array M.P Int Int
-    histogram = runST $ do
-        marr <- MM.makeMArrayS (M.Sz numBuckets + 1) (\_ -> pure 0)
+    histogram = MM.createArrayST_ M.Seq (M.Sz numBuckets + 1) $ \ marr ->
         M.forM_ arr $ \x ->
             let b = floor (x * fromIntegral numBuckets) in
-            MM.modifyM marr (pure . succ) b
-        MM.freezeS marr
+            MM.modifyM_ marr (pure . (+ 1)) b
 
-    absoluteTreshold =
+    absoluteThreshold =
         let target = floor $
-                relativeTreshold * fromIntegral (M.totalElem (M.size arr))
+                relativeThreshold * fromIntegral (M.totalElem (M.size arr))
             go acc i
                 | i >= numBuckets = 1.0
                 | otherwise       =
@@ -215,23 +193,17 @@ treshold relativeTreshold arr =
                         else go acc' (i + 1)  in
         go 0 0
 
-floatToWord8 :: Float -> Word8
-floatToWord8 = round . (* 255)
-
-pixelToWord8 :: JP.PixelRGBF -> JP.PixelRGB8
-pixelToWord8 (JP.PixelRGBF r g b) =
-    JP.PixelRGB8 (floatToWord8 r) (floatToWord8 g) (floatToWord8 b)
-
 palette :: JP.Palette
-palette = JP.generateImage
-    (\x _ -> pixelToWord8 $ interpolate (fromIntegral x / 255.0) blue white)
-    256
-    1
+palette =
+    MIO.toJPImageRGB8 $
+    M.resize' (Sz2 1 256) $
+    M.makeArrayR D Seq (Sz1 256) $ \x ->
+      toWord8 $ interpolate (fromIntegral x / 255.0) blue white
 
-dark, blue, white :: JP.PixelRGBF
-dark  = JP.PixelRGBF 0.0 0.1 0.3
-blue  = JP.PixelRGBF 0.0 0.4 1.0
-white = JP.PixelRGBF 1.0 1.0 1.0
+dark, blue, white :: Pixel RGB Float
+dark  = PixelRGB 0.0 0.1 0.3
+blue  = PixelRGB 0.0 0.4 1.0
+white = PixelRGB 1.0 1.0 1.0
 
 class Interpolate a where
     interpolate :: Float -> a -> a -> a
@@ -239,153 +211,128 @@ class Interpolate a where
 instance Interpolate Float where
     interpolate t x y = (1.0 - t) * x + t * y
 
-instance Interpolate JP.PixelRGBF where
-    interpolate t (JP.PixelRGBF r0 g0 b0) (JP.PixelRGBF r1 g1 b1) = JP.PixelRGBF
-        (interpolate t r0 r1) (interpolate t g0 g1) (interpolate t b0 b1)
+instance Interpolate (Pixel RGB Float) where
+    interpolate t = liftA2 (interpolate t)
 
 interpolateFrames
-    :: M.Index ix
-    => Int  -- Number of interpolation frames to insert
-    -> [M.Array M.D ix Float]
-    -> [M.Array M.D ix Float]
-interpolateFrames _   []           = []
-interpolateFrames _   [x]          = [x]
-interpolateFrames num (x : y : ys) =
-    [x] ++
-    [ M.zipWith (interpolate (fromIntegral n * spacing)) x y
-    | n <- [1 .. num]
-    ] ++
-    interpolateFrames num (y : ys)
+    :: Int  -- Number of interpolation frames to insert
+    -> M.Array M.B M.Ix1 (M.Array M.M Ix2 Float)
+    -> M.Array M.B M.Ix1 (MIO.Image M.S Y Word8)
+interpolateFrames num arr =
+    maybe (M.compute (M.map toArrayY arr)) (M.compute . setComp Par) $ do
+      (_, arr') <- M.unconsM arr
+      (_, l) <- M.unsnocM arr
+      let frames = mconcat $ M.toList $ M.zipWith interpolateSingle arr arr'
+      pure $ M.snoc frames $ toArrayY l
   where
     spacing = 1.0 / fromIntegral (num + 1)
+    toArrayY :: Source r Ix2 Float => M.Array r Ix2 Float -> MIO.Image M.S Y Word8
+    toArrayY = M.compute . M.map (PixelY . eToWord8)
+    interpolateSingle ::
+      M.Array M.M Ix2 Float -> M.Array M.M Ix2 Float -> M.Array M.DL Ix1 (MIO.Image M.S Y Word8)
+    interpolateSingle x y =
+      M.cons (toArrayY x) $
+      M.toLoadArray $
+      (\n -> toArrayY (M.zipWith (interpolate (fromIntegral n * spacing :: Float)) x y)) <$>
+      (1 ... num)
 
 
 --------------------------------------------------------------------------------
 -- | Parallellizing the drawing across cores
 
-mapReduce
-    :: (String -> IO ())  -- ^ Logger
-    -> [a]                -- ^ Items to process
-    -> (a -> b)           -- ^ Map
-    -> (b -> b -> b)      -- ^ Reduce
-    -> IO b
-mapReduce logger as f g = do
-    bChan <- Chan.newChan
-    bDone <- IORef.newIORef (0 :: Int)
-    _     <- forkIO $ do
-        Scheduler.withScheduler_ Scheduler.Par $ \scheduler ->
-            forM_ as $ \a ->
-            Scheduler.scheduleWork_ scheduler $ do
-            let !b = f a
-            done <- IORef.atomicModifyIORef' bDone $ \n -> (succ n, succ n)
-            logger $ "Finished job " ++ show done ++ "/" ++ show num
-            Chan.writeChan bChan $ Just b
-        Chan.writeChan bChan Nothing
-
-    bs <- catMaybes . takeWhile isJust <$> Chan.getChanContents bChan
-    case bs of
-        []      -> fail "mapReduce: empty list"
-        bh : bt -> return $ foldl' g bh bt
-  where
-    num = length as
-
 divideWork :: Int -> Int -> [Int]
 divideWork total workers =
     let (items, remainder) = total `divMod` workers in
-    zipWith (+) (replicate remainder 1 ++ repeat 0) (replicate workers items)
+    L.zipWith (+) (RIO.replicate remainder 1 ++ repeat 0) (RIO.replicate workers items)
 
-makeClouds
-    :: M.Index ix
-    => (String -> IO ())   -- ^ Logging
-    -> FractalParams ix    -- ^ Parameters
-    -> IO (M.Array M.P ix Float)
-makeClouds logger fp@FractalParams {..} = do
-    jobs <- forM (divideWork fpNumPulses 32) $ \items -> do
-        seed <- MWC.withSystemRandom $ MWC.asGenIO $
-            V.replicateM 32 . MWC.uniform
-        return (items :: Int, seed :: V.Vector Word32)
+weights :: Int -> Int -> M.Array M.P Int Int
+weights fpNumPulses nWorkers = M.fromList Par $ divideWork fpNumPulses nWorkers
 
-    summed <- mapReduce logger jobs
-        (\(items, seed) -> runST $ do
-            gen <- MWC.initialize seed
-            makeFractal fp {fpNumPulses = items} gen)
-        (\x y -> M.computeProxy (Proxy :: Proxy M.P) $ M.zipWith (+) x y)
 
-    return $ M.computeProxy (Proxy :: Proxy M.P) $
-        fmap scurve $ treshold fpTreshold $
-        normalize $ M.delay summed
+makeClouds ::
+     (Num ix, M.Index ix) => RIO (FractalParams ix) (M.Array M.P ix Float)
+makeClouds = do
+    fp@FractalParams {..} <- ask
+    bDone <- newIORef (0 :: Int)
+    wss <- initWorkerStates Par $ \(Scheduler.WorkerId i) -> do
+        gen <- liftIO MWC.createSystemRandom
+        marr <- MM.new fpCropSize
+        pure (i, gen, marr)
+    let jobs = weights fpNumPulses 32
+        num = M.unSz (M.size jobs)
+    _ :: M.Array M.U M.Ix1 () <- M.forWS wss jobs $ \items (i, gen, marr) -> do
+            runRIO (fp {fpNumPulses = items}) $ writeFractal gen marr
+            done <- atomicModifyIORef' bDone $ \n -> let n' = n + 1 in (n', n')
+            logInfo $ "Worker: " <> display i <> " finished job " <>
+                      display done <> "/" <> display num
+    fractals <-
+        M.createArray_ @M.P M.Par fpCropSize $ \ scheduler marr ->
+            let collect fractal =
+                  iforSchedulerM_ scheduler fractal $ \ ix e ->
+                  modifyM_ marr (pure . (+ e)) ix
+            in RIO.mapM (\(_, _, m) -> M.unsafeFreeze Par m >>= collect) $
+               RIO.toList $ Scheduler._workerStatesArray wss
+    return $ M.computeAs M.P $
+        fmap scurve $ threshold fpThreshold $ normalize $ M.delay fractals
   where
     scurve x = (1 + cos ((x - 1) * pi)) / 2
 
 makeGradientBackground
-    :: PrimMonad m
-    => MWC.Gen (PrimState m) -> Int -> Int -> m (JP.Image JP.PixelRGBF)
-makeGradientBackground gen width height = do
+    :: (PrimMonad m)
+    => MWC.Gen (PrimState m) -> M.Sz2 -> m (MIO.Image M.D RGB Float)
+makeGradientBackground gen sz@(M.Sz2 height width) = do
     phi <- MWC.uniformR (0, 2 * pi) gen
     let measure = fromIntegral $ max width height
         rho     = 3 * measure
         cx      = fromIntegral width  * 0.5 + rho * cos phi
         cy      = fromIntegral height * 0.5 + rho * sin phi
-        render  = \x y ->
+    pure $ M.makeArray Par sz $ \ (y :. x) ->
             let dx   = fromIntegral x - cx
                 dy   = fromIntegral y - cy
                 dist = sqrt $ dx * dx + dy * dy
                 t    = (dist - (rho - measure)) / (2 * measure) in
             interpolate t blue dark
-    pure $ JP.generateImage render width height
 
-main2d :: IO ()
-main2d = do
+
+main2d :: LogFunc -> IO ()
+main2d lf = do
     let height   =  900
         width    = 1600
-        small    = M.Ix2 height width
-        world    = M.Sz (small .+. small .+. small)
+        small    = M.Sz2 height width
+        world    = 3 * small
         v        = 3
 
         fp = FractalParams
             { fpWorld      = world
-            , fpCropOffset = small
-            , fpCropSize   = M.Sz small
+            , fpCropOffset = M.unSz small
+            , fpCropSize   = small
             , fpNumPulses  = M.totalElem world * v
             , fpAlpha      = 5 / 3
             , fpPulseShape = Rectangular -- Annuli 1.2 8
             , fpRhoIn      = 0.0
             , fpRhoOut     = fromIntegral (max height width) * 1.5
-            , fpTreshold   = 0.6
+            , fpThreshold  = 0.6
+            , fpLogFunc    = lf
             }
 
-    -- Logging
-    lock <- MVar.newMVar ()
-    let logger = MVar.modifyMVar_ lock . const . IO.hPutStrLn IO.stderr
-
-    gradientBackground <- MWC.withSystemRandom $ \gen ->
-        (makeGradientBackground gen width height :: IO (JP.Image JP.PixelRGBF))
+    gradientBackground <- MWC.withSystemRandom . MWC.asGenST $ (`makeGradientBackground` small)
 
     -- Blend the background and the foreground.
-    clouds <- fmap
-        (MV.toVector .  M.computeProxy (Proxy :: Proxy M.P) . M.delay)
-        (makeClouds logger fp)
-    let image :: JP.Image JP.PixelRGBF
-        image = JP.generateImage
-            (\x y ->
-                let bg    = JP.pixelAt gradientBackground x y
-                    cloud = clouds V.! (x + y * width) in
-                interpolate cloud bg white)
-            width
-            height
+    clouds <- runRIO fp makeClouds
+    let image :: MIO.Image M.D RGB Float
+        image = M.zipWith (\cloud bg -> interpolate cloud bg white) clouds gradientBackground
+    MIO.writeImage "2d.png" $ M.map toWord8 image
 
-    JP.writePng "2d.png" $ JP.pixelMap pixelToWord8 image
-
-main3d :: IO ()
-main3d = do
+main3d :: LogFunc -> IO ()
+main3d lf = do
     let numkeyframes =  32
         nonkeyframes =   2
-        delay        =   4
+        gifDelay     =   4
 
         height   = 200
         width    = 300
         small    = M.Ix3 numkeyframes height width
-        world    = M.Sz (1 .+. small .+. small)
+        world    = M.Sz (1 + 2 * small)
         v        = 1
 
         fp = FractalParams
@@ -397,26 +344,19 @@ main3d = do
             , fpPulseShape = Annuli 1.2 8
             , fpRhoIn      = 0.0
             , fpRhoOut     = fromIntegral (max height width) * 1.5
-            , fpTreshold   = 0.6
+            , fpThreshold  = 0.6
+            , fpLogFunc    = lf
             }
 
-    -- Logging
-    lock <- MVar.newMVar ()
-    let logger = MVar.modifyMVar_ lock . const . IO.hPutStrLn IO.stderr
+    cuby <- runRIO fp makeClouds
 
-    cuby <- makeClouds logger fp
-
-    logger "Generating keyframes..."
-    let keyframes :: [M.Array M.M M.Ix2 Float]
-        keyframes = [cuby M.!> d | d <- [0 .. numkeyframes - 1]]
+    runRIO fp $ logInfo "Generating keyframes..."
+    let keyframes :: M.Array M.D M.Ix1 (M.Array M.M M.Ix2 Float)
+        keyframes = M.map (cuby M.!>) (0 ..: numkeyframes)
 
         frames :: [JP.Image Word8]
-        frames =
-            [ JP.Image width height $ MV.toVector $
-                M.computeProxy (Proxy :: Proxy M.P) $
-                fmap floatToWord8 frame
-            | frame <- interpolateFrames nonkeyframes (map M.delay keyframes)
-            ]
+        frames = M.toList $ M.map MIO.toJPImageY8 $
+                 interpolateFrames nonkeyframes $ M.compute keyframes
 
     either fail id $ JP.writeComplexGifImage "3d.gif" JP.GifEncode
         { JP.geWidth      = width
@@ -431,11 +371,22 @@ main3d = do
                 , JP.gfYOffset     = 0
                 , JP.gfPalette     = Nothing
                 , JP.gfTransparent = Nothing
-                , JP.gfDelay       = delay
+                , JP.gfDelay       = gifDelay
                 , JP.gfDisposal    = JP.DisposalDoNot
                 , JP.gfPixels      = frame
                 }
         }
+    runRIO fp $ logInfo $ "Generated " <> display (L.length frames) <> " frames"
 
 main :: IO ()
-main = main2d >> main3d
+main = do
+  lo <- logOptionsHandle stdout False
+  withLogFunc lo $ \ lf ->
+    main2d lf >> main3d lf
+
+
+-- TODO:
+--  * Add `forWS_`, `iforWS_`, 'imapWS_` and `mapWS_`
+--  * Add public function for extracting the states (i.e. F.toList . Scheduler._workerStatesArray),
+--    while checking for IORef
+--  * Generalize `ConcatOuterM` to `Foldable`
