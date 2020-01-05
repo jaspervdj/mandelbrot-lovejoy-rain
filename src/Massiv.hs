@@ -11,8 +11,6 @@ module Main
 import qualified Codec.Picture.Gif                 as JP
 import qualified Codec.Picture.Png                 as JP
 import qualified Codec.Picture.Types               as JP
-import           Control.Concurrent                (forkIO)
-import qualified Control.Concurrent.Chan           as Chan
 import qualified Control.Concurrent.MVar           as MVar
 import           Control.Monad                     (foldM, forM, forM_,
                                                     replicateM_, when)
@@ -26,8 +24,7 @@ import qualified Data.Massiv.Array                 as M
 import qualified Data.Massiv.Array.Manifest.Vector as MV
 import qualified Data.Massiv.Array.Mutable         as MM
 import qualified Data.Massiv.Array.Unsafe          as M
-import           Data.Maybe                        (catMaybes, fromMaybe,
-                                                    isJust, listToMaybe)
+import           Data.Maybe                        (fromMaybe, listToMaybe)
 import           Data.Proxy                        (Proxy (..))
 import qualified Data.Vector                       as V
 import           Data.Word                         (Word32)
@@ -270,19 +267,15 @@ mapReduce
     -> (b -> b -> b)      -- ^ Reduce
     -> IO b
 mapReduce logger as f g = do
-    bChan <- Chan.newChan
     bDone <- IORef.newIORef (0 :: Int)
-    _     <- forkIO $ do
-        Scheduler.withScheduler_ Scheduler.Par $ \scheduler ->
+    bs    <-
+        Scheduler.withScheduler Scheduler.Par $ \scheduler ->
             forM_ as $ \a ->
-            Scheduler.scheduleWork_ scheduler $ do
-            let !b = f a
-            done <- IORef.atomicModifyIORef' bDone $ \n -> (succ n, succ n)
+            Scheduler.scheduleWork scheduler $ do
+            let b = f a
+            done <- b `seq` IORef.atomicModifyIORef' bDone $ \n -> (succ n, succ n)
             logger $ "Finished job " ++ show done ++ "/" ++ show num
-            Chan.writeChan bChan $ Just b
-        Chan.writeChan bChan Nothing
-
-    bs <- catMaybes . takeWhile isJust <$> Chan.getChanContents bChan
+            pure b
     case bs of
         []      -> fail "mapReduce: empty list"
         bh : bt -> return $ foldl' g bh bt
